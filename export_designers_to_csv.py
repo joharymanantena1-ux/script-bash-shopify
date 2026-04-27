@@ -57,6 +57,8 @@ SELECT
     prnt.body       AS texte,
     prnt.slug       AS slug,
     CONCAT(img.signature, '.', img.extension) AS image_file,
+    img.id          AS image_id,
+    img.extension   AS image_ext,
     prn.color       AS couleur,
     t.locale        AS langue
 FROM product_refs_nested prn
@@ -77,6 +79,8 @@ SELECT DISTINCT
     prnt.body       AS texte,
     prnt.slug       AS slug,
     CONCAT(img.signature, '.', img.extension) AS image_file,
+    img.id          AS image_id,
+    img.extension   AS image_ext,
     prn.color       AS couleur,
     t.locale        AS langue
 FROM product_refs_nested prn
@@ -124,7 +128,7 @@ ORDER BY prev.product_id
 
 DESIGNERS_COLUMNS = [
     "wee_designer_id", "nom", "baseline", "introduction",
-    "texte", "slug", "image_file", "couleur", "langue",
+    "texte", "slug", "image_file", "image_id", "image_ext", "couleur", "langue",
 ]
 
 LINKS_COLUMNS = ["product_id", "wee_designer_id", "designer_nom"]

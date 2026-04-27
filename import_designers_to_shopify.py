@@ -136,29 +136,185 @@ class ImportReport:
 
 # ── Conversion CSV → champs Shopify ──────────────────────────────────────────
 
-def designer_row_to_fields(row: dict) -> dict[str, str]:
+def designer_row_to_fields(row: dict, image_gid: str | None = None) -> dict[str, str]:
     """
     Convertit une ligne de designers.csv en dict de champs metaobject Shopify.
 
-    Mapping vers la définition existante dans Shopify :
-      nom            (single_line_text_field)
-      baseline       (multi_line_text_field)
-      introduction   (multi_line_text_field)
-      texte          (multi_line_text_field)
-      image          (file_reference) — NON géré ici, upload séparé requis
-      wee_designer_id (single_line_text_field)
-
-    Champs ignorés (absents de la définition Shopify actuelle) :
-      slug, couleur, langue — à ajouter à la définition si besoin.
+    Mapping CSV → clé Shopify :
+      nom       → name            (single_line_text_field, requis)
+      texte     → body            (multi_line_text_field)
+      couleur   → color           (single_line_text_field)
+      langue    → locale          (single_line_text_field, normalisé fr_FR→fr-FR)
+      image_gid → image           (file_reference, GID résolu séparément)
     """
-    return {
+    locale_raw = row.get("langue", "")
+    locale = locale_raw.replace("_", "-") if locale_raw else ""
+
+    fields = {
         "wee_designer_id": str(row.get("wee_designer_id", "")),
-        "nom":             row.get("nom", ""),
+        "name":            row.get("nom", ""),
         "baseline":        row.get("baseline", ""),
         "introduction":    row.get("introduction", ""),
-        "texte":           row.get("texte", ""),
-        # image ignorée : type file_reference, nécessite un GID de fichier uploadé
+        "body":            row.get("texte", ""),
+        "slug":            row.get("slug", ""),
+        "image_file":      row.get("image_file", ""),
+        "color":           row.get("couleur", ""),
+        "locale":          locale,
     }
+    if image_gid:
+        fields["image"] = image_gid
+    return fields
+
+
+# ── Résolution d'image (intégrée dans l'import) ───────────────────────────────
+
+_GID_MAP_COLUMNS = ["image_file", "shopify_gid", "source"]
+
+def _file_hash_path(image_id: int, extension: str) -> str:
+    """
+    Calcule le chemin d'une image Wee depuis son ID (file_hash_12).
+    Exemple : image_id=197526, ext='jpg' → '0000/0197/197526.jpg'
+    Exemple : image_id=72,     ext='jpg' → '0000/0000/72.jpg'
+    """
+    d1 = str(image_id // 1_000_000).zfill(4)
+    d2 = str((image_id % 1_000_000) // 1_000).zfill(4)
+    return f"{d1}/{d2}/{image_id}.{extension}"
+
+
+def _load_image_gid_map(path: Path) -> dict[str, str]:
+    """Charge output/image_gid_map.csv → {image_file: shopify_gid}."""
+    if not path.exists():
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        return {
+            row["image_file"]: row["shopify_gid"]
+            for row in csv.DictReader(f)
+            if row.get("shopify_gid") and not row["shopify_gid"].startswith("[DRY-RUN")
+        }
+
+
+def _save_image_gid_map(gid_map: dict[str, str], sources: dict[str, str], path: Path) -> None:
+    """Sauvegarde la carte {image_file → GID} dans output/image_gid_map.csv."""
+    rows = [
+        {"image_file": k, "shopify_gid": v, "source": sources.get(k, "")}
+        for k, v in gid_map.items()
+    ]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=_GID_MAP_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+    logger.info("image_gid_map.csv mis à jour : %d entrée(s)", len(rows))
+
+
+def _resolve_image_gid(
+    row: dict,
+    client: ShopifyClient,
+    gid_map: dict[str, str],
+    sources: dict[str, str],
+    drive_service,
+    drive_folder_id: str | None,
+) -> str | None:
+    """
+    Résout le GID Shopify d'une image designer, dans cet ordre :
+      1. Cache local (image_gid_map.csv)
+      2. Recherche Shopify Files par nom de fichier ID-based (ex: 197526.jpg)
+      3. IMAGE_BASE_URL → fileCreate (Shopify télécharge directement)
+      4. Google Drive → téléchargement + staged upload vers Shopify Files
+
+    La clé de cache est toujours image_id (ex: '197526') pour rester stable
+    même si la signature change.
+    """
+    image_id_raw = row.get("image_id", "")
+    image_ext = row.get("image_ext", "jpg") or "jpg"
+    image_file = row.get("image_file", "")  # signature.ext (conservé pour le champ texte)
+
+    if not image_id_raw:
+        return None
+
+    try:
+        image_id = int(image_id_raw)
+    except (ValueError, TypeError):
+        return None
+
+    cache_key = str(image_id)
+    id_filename = f"{image_id}.{image_ext}"                     # ex: 197526.jpg
+    hash_path = _file_hash_path(image_id, image_ext)            # ex: 0000/0197/197526.jpg
+    drive_search_names = [id_filename, hash_path.split("/")[-1]] # [197526.jpg]
+
+    # 1. Cache local
+    if cache_key in gid_map:
+        return gid_map[cache_key]
+
+    # 2. Recherche Shopify Files (par ID-filename et par signature-filename)
+    for search_name in [id_filename, image_file]:
+        if not search_name:
+            continue
+        gid = client.find_image_gid_by_filename(search_name)
+        if gid:
+            logger.info("Image trouvée dans Shopify Files (%s) → %s", search_name[:30], gid)
+            gid_map[cache_key] = gid
+            sources[cache_key] = "shopify_files"
+            return gid
+
+    # 3. IMAGE_BASE_URL → Shopify télécharge directement l'image
+    if config.IMAGE_BASE_URL:
+        # On essaie d'abord le chemin ID-based, puis signature
+        for url_path in [hash_path, id_filename, image_file]:
+            if not url_path:
+                continue
+            source_url = f"{config.IMAGE_BASE_URL}/{url_path}"
+            logger.info("Tentative fileCreate via IMAGE_BASE_URL : %s", source_url[:80])
+            try:
+                gid = client.file_create(source_url, id_filename)
+                if gid:
+                    ok = client.wait_for_file_ready(gid, max_attempts=8, delay=2.0)
+                    if ok:
+                        logger.info("  Image importée via URL → GID : %s", gid)
+                        gid_map[cache_key] = gid
+                        sources[cache_key] = "image_base_url"
+                        return gid
+                    else:
+                        logger.warning("  Fichier FAILED/TIMEOUT pour %s", source_url[:60])
+                        break
+            except ShopifyGraphQLError as e:
+                logger.debug("  fileCreate URL échoué (%s) : %s", url_path[:30], e)
+
+    # 4. Google Drive → download + upload Shopify
+    if drive_service is None:
+        logger.warning(
+            "Image id=%s absente de Shopify Files. Options disponibles :\n"
+            "  A) Mettre IMAGE_BASE_URL dans .env (si CDN accessible)\n"
+            "  B) Uploader '%s' dans Google Drive dossier '%s'\n"
+            "  C) Upload manuel Shopify Files → ajouter GID dans image_gid_map.csv",
+            image_id, id_filename, config.GOOGLE_DRIVE_FOLDER_NAME,
+        )
+        return None
+
+    logger.info("Recherche image id=%s dans Google Drive...", image_id)
+    from google_drive import download_file
+    file_bytes = None
+    for drive_name in drive_search_names:
+        file_bytes = download_file(drive_service, drive_name, drive_folder_id)
+        if file_bytes:
+            logger.info("  Trouvé dans Drive : '%s' (%d Ko)", drive_name, len(file_bytes) // 1024)
+            break
+
+    if not file_bytes:
+        logger.warning(
+            "Image id=%s introuvable dans Drive (cherché : %s). Champ image laissé vide.",
+            image_id, ", ".join(drive_search_names),
+        )
+        return None
+
+    gid = client.upload_image_from_bytes(id_filename, file_bytes)
+    if gid:
+        logger.info("  Upload OK - GID : %s", gid)
+        client.wait_for_file_ready(gid, max_attempts=8, delay=2.0)
+        gid_map[cache_key] = gid
+        sources[cache_key] = "google_drive"
+    else:
+        logger.warning("  Upload échoué pour image id=%s.", image_id)
+    return gid
 
 
 # ── Logique principale ────────────────────────────────────────────────────────
@@ -184,8 +340,29 @@ def import_designers(
         designers = [d for d in designers if str(d["wee_designer_id"]) in relevant_ids]
         logger.info("Mode test : %d designer(s) à traiter pour product_id=%s", len(designers), test_product_id)
 
-    # On regroupe par wee_designer_id (une entrée par langue → on prend la FR par défaut)
-    # Pour une migration multilingue, dupliquer les metaobjects ou utiliser les Translations API.
+    # On regroupe par wee_designer_id (une entrée par langue → on prend fr_FR en priorité)
+    # Tri : fr_FR en premier, puis les autres langues
+    designers = sorted(designers, key=lambda r: (0 if r.get("langue", "") == "fr_FR" else 1))
+
+    # Initialisation de la résolution d'images
+    gid_map_path = config.OUTPUT_DIR / "image_gid_map.csv"
+    image_gid_cache = _load_image_gid_map(gid_map_path)
+    image_sources: dict[str, str] = {}
+    if image_gid_cache:
+        logger.info("Carte GID images chargée depuis CSV : %d entrée(s)", len(image_gid_cache))
+
+    # Connexion Google Drive (optionnelle — si credentials disponibles)
+    drive_service = None
+    drive_folder_id = None
+    try:
+        from google_drive import get_drive_service, find_folder_id
+        drive_service = get_drive_service()
+        if drive_service:
+            drive_folder_id = find_folder_id(drive_service, config.GOOGLE_DRIVE_FOLDER_NAME)
+            logger.info("Google Drive disponible (dossier '%s')", config.GOOGLE_DRIVE_FOLDER_NAME)
+    except Exception as exc:
+        logger.debug("Google Drive non disponible : %s", exc)
+
     seen_ids: set[str] = set()
     id_to_gid: dict[str, str] = {}
 
@@ -199,7 +376,15 @@ def import_designers(
             continue
         seen_ids.add(wee_id)
 
-        fields = designer_row_to_fields(row)
+        image_gid = _resolve_image_gid(
+            row=row,
+            client=client,
+            gid_map=image_gid_cache,
+            sources=image_sources,
+            drive_service=drive_service,
+            drive_folder_id=drive_folder_id,
+        )
+        fields = designer_row_to_fields(row, image_gid=image_gid)
         action = "skipped"
         gid = None
 
@@ -235,6 +420,10 @@ def import_designers(
                 statut="error",
                 message=str(e),
             )
+
+    # Persister la carte GID images pour éviter re-uploads lors du prochain run
+    if image_gid_cache:
+        _save_image_gid_map(image_gid_cache, image_sources, gid_map_path)
 
     return id_to_gid
 

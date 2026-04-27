@@ -190,10 +190,87 @@ class ShopifyClient:
                     return gid
         return None
 
+    def find_image_gid_by_filename(self, filename: str) -> str | None:
+        """
+        Cherche dans Shopify Files une image par nom de fichier.
+        Stratégies successives :
+          1. filename exact (ex: abc123.jpg)
+          2. stem seul sans extension (Shopify peut tronquer les noms longs)
+          3. 40 premiers caractères du stem (hash tronqué)
+        Retourne le GID (MediaImage) ou None si introuvable.
+        """
+        from pathlib import Path as _Path
+        stem = _Path(filename).stem          # sans extension
+        candidates = [filename, stem, stem[:40]]
+        # Dédoublonnage tout en préservant l'ordre
+        seen: set[str] = set()
+        search_terms = [c for c in candidates if c and c not in seen and not seen.add(c)]  # type: ignore[func-returns-value]
+
+        gql = """
+        query FindFile($query: String!) {
+          files(first: 5, query: $query) {
+            edges {
+              node {
+                ... on MediaImage {
+                  id
+                  fileStatus
+                  image { url }
+                }
+              }
+            }
+          }
+        }
+        """
+        for term in search_terms:
+            try:
+                data = self._run(gql, {"query": f"filename:{term}"})
+                edges = data.get("files", {}).get("edges", [])
+                for edge in edges:
+                    node = edge.get("node", {})
+                    gid = node.get("id")
+                    if gid:
+                        logger.debug("Image trouvée par term '%s…' : %s", term[:20], gid)
+                        return gid
+            except Exception as exc:
+                logger.debug("Erreur recherche image '%s…' : %s", term[:20], exc)
+        return None
+
+    def upload_image_from_bytes(self, filename: str, file_bytes: bytes) -> str | None:
+        """
+        Pipeline complet : staged upload → POST S3 → fileCreate.
+        Retourne le GID MediaImage ou None (dry-run / erreur).
+        """
+        import mimetypes
+        content_type = mimetypes.guess_type(filename)[0] or "image/jpeg"
+
+        # 1. Staged upload
+        target = self.staged_upload_create(filename, content_type, len(file_bytes))
+        upload_url = target["url"]
+        resource_url = target["resourceUrl"]
+        params = {p["name"]: p["value"] for p in target["parameters"]}
+
+        if self.dry_run:
+            logger.info("[DRY-RUN] Upload image ignoré : %s", filename[:40])
+            return None
+
+        # 2. POST binaire vers S3
+        import requests as _req
+        files_payload = {**params, "file": (filename, file_bytes, content_type)}
+        resp = _req.post(upload_url, files=files_payload)
+        if resp.status_code not in (200, 201, 204):
+            logger.error(
+                "Erreur S3 upload '%s' : HTTP %d — %s",
+                filename[:40], resp.status_code, resp.text[:200],
+            )
+            return None
+        logger.debug("S3 upload OK : %s", filename[:40])
+
+        # 3. fileCreate
+        return self.file_create(resource_url, filename)
+
     def create_metaobject(self, fields: dict[str, str]) -> str | None:
         """
-        Crée un metaobject 'designer'. Retourne son GID ou None (dry-run).
-        `fields` est un dict {key: value} correspondant aux champs du metaobject.
+        Crée un metaobject 'designer' avec statut ACTIVE. Retourne son GID ou None (dry-run).
         """
         fields_input = [{"key": k, "value": v} for k, v in fields.items() if v]
         query = """
@@ -202,6 +279,9 @@ class ShopifyClient:
             metaobject {
               id
               handle
+              capabilities {
+                publishable { status }
+              }
             }
             userErrors {
               field
@@ -215,6 +295,9 @@ class ShopifyClient:
             "metaobject": {
                 "type": "designer",
                 "fields": fields_input,
+                "capabilities": {
+                    "publishable": {"status": "ACTIVE"}
+                },
             }
         }
         data = self._run_mutation(query, variables)
@@ -226,18 +309,22 @@ class ShopifyClient:
         if user_errors:
             raise ShopifyGraphQLError(f"userErrors lors de la création du metaobject : {user_errors}")
 
-        gid = result["metaobject"]["id"]
-        logger.info("Metaobject designer créé : %s", gid)
-        return gid
+        mo = result["metaobject"]
+        status = mo.get("capabilities", {}).get("publishable", {}).get("status", "?")
+        logger.info("Metaobject designer créé : %s (statut=%s)", mo["id"], status)
+        return mo["id"]
 
     def update_metaobject(self, gid: str, fields: dict[str, str]) -> None:
-        """Met à jour les champs d'un metaobject existant."""
+        """Met à jour les champs d'un metaobject existant et force le statut ACTIVE."""
         fields_input = [{"key": k, "value": v} for k, v in fields.items() if v]
         query = """
         mutation UpdateDesigner($id: ID!, $metaobject: MetaobjectUpdateInput!) {
           metaobjectUpdate(id: $id, metaobject: $metaobject) {
             metaobject {
               id
+              capabilities {
+                publishable { status }
+              }
             }
             userErrors {
               field
@@ -246,14 +333,20 @@ class ShopifyClient:
           }
         }
         """
-        data = self._run_mutation(query, {"id": gid, "metaobject": {"fields": fields_input}})
+        payload = {
+            "fields": fields_input,
+            "capabilities": {"publishable": {"status": "ACTIVE"}},
+        }
+        data = self._run_mutation(query, {"id": gid, "metaobject": payload})
         if not data:
             return  # dry-run
 
-        user_errors = data.get("metaobjectUpdate", {}).get("userErrors", [])
+        result = data.get("metaobjectUpdate", {})
+        user_errors = result.get("userErrors", [])
         if user_errors:
             raise ShopifyGraphQLError(f"userErrors lors de la mise à jour : {user_errors}")
-        logger.info("Metaobject designer mis à jour : %s", gid)
+        status = result.get("metaobject", {}).get("capabilities", {}).get("publishable", {}).get("status", "?")
+        logger.info("Metaobject designer mis à jour : %s (statut=%s)", gid, status)
 
     # ── Metafields produit ────────────────────────────────────────────────────
 
@@ -272,6 +365,115 @@ class ShopifyClient:
         data = self._run(query, {"id": product_gid, "namespace": namespace, "key": key})
         mf = data.get("product", {}).get("metafield")
         return mf["id"] if mf else None
+
+    # ── Upload d'images vers Shopify Files ────────────────────────────────────
+
+    def staged_upload_create(self, filename: str, content_type: str, file_size: int) -> dict:
+        """
+        Crée un staged upload Shopify. Retourne {url, resourceUrl, parameters}.
+        Doit être appelé avant l'upload binaire vers S3.
+        """
+        query = """
+        mutation StagedUploadsCreate($input: [StagedUploadInput!]!) {
+          stagedUploadsCreate(input: $input) {
+            stagedTargets {
+              url
+              resourceUrl
+              parameters { name value }
+            }
+            userErrors { field message }
+          }
+        }
+        """
+        variables = {
+            "input": [{
+                "resource": "IMAGE",
+                "filename": filename,
+                "mimeType": content_type,
+                "fileSize": str(file_size),
+                "httpMethod": "POST",
+            }]
+        }
+        # Note : staged upload est une mutation mais elle ne modifie pas de données
+        # publiques — on l'autorise même en dry-run pour tester le flux.
+        data = self._run(query, variables)
+        result = data.get("stagedUploadsCreate", {})
+        user_errors = result.get("userErrors", [])
+        if user_errors:
+            raise ShopifyGraphQLError(f"userErrors stagedUpload : {user_errors}")
+        targets = result.get("stagedTargets", [])
+        if not targets:
+            raise ShopifyGraphQLError("Aucun stagedTarget retourné par Shopify")
+        return targets[0]
+
+    def file_create(self, resource_url: str, filename: str) -> str | None:
+        """
+        Crée un fichier dans Shopify Files depuis un staged upload.
+        Retourne le GID MediaImage ou None (dry-run).
+        """
+        query = """
+        mutation FileCreate($files: [FileCreateInput!]!) {
+          fileCreate(files: $files) {
+            files {
+              ... on MediaImage {
+                id
+                fileStatus
+                image { url }
+              }
+            }
+            userErrors { field message }
+          }
+        }
+        """
+        variables = {
+            "files": [{
+                "originalSource": resource_url,
+                "contentType": "IMAGE",
+                "filename": filename,
+            }]
+        }
+        data = self._run_mutation(query, variables)
+        if not data:
+            return None  # dry-run
+
+        result = data.get("fileCreate", {})
+        user_errors = result.get("userErrors", [])
+        if user_errors:
+            raise ShopifyGraphQLError(f"userErrors fileCreate : {user_errors}")
+
+        files = result.get("files", [])
+        if not files:
+            raise ShopifyGraphQLError("fileCreate : aucun fichier retourné")
+
+        gid = files[0].get("id")
+        status = files[0].get("fileStatus", "?")
+        logger.info("Fichier Shopify créé : %s (statut=%s)", gid, status)
+        return gid
+
+    def wait_for_file_ready(self, gid: str, max_attempts: int = 10, delay: float = 2.0) -> bool:
+        """Poll jusqu'à ce que le fichier soit en statut READY. Retourne True si prêt."""
+        query = """
+        query FileStatus($id: ID!) {
+          node(id: $id) {
+            ... on MediaImage {
+              id
+              fileStatus
+            }
+          }
+        }
+        """
+        for attempt in range(1, max_attempts + 1):
+            data = self._run(query, {"id": gid})
+            status = data.get("node", {}).get("fileStatus", "UNKNOWN")
+            if status == "READY":
+                return True
+            if status in ("FAILED", "UPLOADED"):
+                logger.warning("Fichier %s statut inattendu : %s", gid, status)
+                return status != "FAILED"
+            logger.debug("Fichier %s : %s (tentative %d/%d)", gid, status, attempt, max_attempts)
+            time.sleep(delay)
+        logger.warning("Fichier %s non prêt après %d tentatives.", gid, max_attempts)
+        return False
 
     def set_product_metafield(
         self,

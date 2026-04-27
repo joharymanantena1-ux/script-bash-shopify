@@ -49,6 +49,18 @@ TEST_PRODUCT_HANDLE = os.getenv("TEST_PRODUCT_HANDLE", "")
 # DRY_RUN=true par défaut — écriture Shopify désactivée sauf opt-in explicite
 DRY_RUN = os.getenv("DRY_RUN", "true").strip().lower() != "false"
 
+# ── Google Drive ──────────────────────────────────────────────────────────────
+GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "credential-regardbeauty.json")
+GOOGLE_TOKEN_PATH = os.getenv("GOOGLE_TOKEN_PATH", "token.json")
+GOOGLE_DRIVE_FOLDER_NAME = os.getenv("GOOGLE_DRIVE_FOLDER_NAME", "master")
+
+# ── Source images ─────────────────────────────────────────────────────────────
+# Si renseigné, Shopify téléchargera les images directement depuis cette URL publique.
+# Exemple : IMAGE_BASE_URL=https://cdn.exemple.com/images/
+# L'URL finale sera : {IMAGE_BASE_URL}/{image_file}
+# Laisser vide si vous utilisez Google Drive ou l'upload manuel.
+IMAGE_BASE_URL = os.getenv("IMAGE_BASE_URL", "").rstrip("/")
+
 # ── Shopify GraphQL endpoint ─────────────────────────────────────────────────
 SHOPIFY_GRAPHQL_URL = (
     f"https://{SHOPIFY_STORE}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
