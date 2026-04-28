@@ -5,17 +5,25 @@ Lit designers.csv et product_designer_links.csv puis :
   1. Crée ou met à jour les metaobjects 'designer' dans Shopify
   2. Lie chaque produit Shopify à son designer via un metafield
 
-Modes :
+Modes périmètre :
   --test           Traite uniquement le produit de test (DEFAULT)
   --global-import  Traite tous les produits (à activer volontairement)
+
+Modes dry-run :
   --dry-run        Aucune écriture Shopify (simulé) — ACTIVÉ PAR DÉFAUT via .env
   --no-dry-run     Désactive le dry-run (écriture réelle — IRRÉVERSIBLE)
+
+Utilitaires :
+  --preview        Aperçu lecture seule : génère output/import_preview.csv + résumé console
+  --reset-cache    Supprime output/import_state.csv et output/image_gid_map.csv
 
 Usage :
   python import_designers_to_shopify.py --test
   python import_designers_to_shopify.py --test --no-dry-run
   python import_designers_to_shopify.py --global-import --dry-run
   python import_designers_to_shopify.py --global-import --no-dry-run
+  python import_designers_to_shopify.py --test --preview
+  python import_designers_to_shopify.py --test --reset-cache
 """
 
 import argparse
@@ -206,6 +214,31 @@ def _save_image_gid_map(gid_map: dict[str, str], sources: dict[str, str], path: 
     logger.info("image_gid_map.csv mis à jour : %d entrée(s)", len(rows))
 
 
+# ── State cache (reprise après interruption) ──────────────────────────────────
+
+_STATE_COLUMNS = [
+    "wee_designer_id", "shopify_metaobject_gid",
+    "image_status", "product_status", "processed_at",
+]
+
+
+def _load_import_state(path: Path) -> dict[str, dict]:
+    """Charge output/import_state.csv → {wee_designer_id: {cols...}}."""
+    if not path.exists():
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        return {row["wee_designer_id"]: row for row in csv.DictReader(f)}
+
+
+def _save_designer_state(state: dict[str, dict], path: Path) -> None:
+    """Persiste l'état complet dans import_state.csv (appelé après chaque designer)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=_STATE_COLUMNS)
+        writer.writeheader()
+        writer.writerows(state.values())
+
+
 def _resolve_image_gid(
     row: dict,
     client: ShopifyClient,
@@ -363,6 +396,12 @@ def import_designers(
     except Exception as exc:
         logger.debug("Google Drive non disponible : %s", exc)
 
+    # Chargement du state cache (reprise après interruption)
+    state_path = config.OUTPUT_DIR / "import_state.csv"
+    import_state = _load_import_state(state_path)
+    if import_state:
+        logger.info("State cache charge : %d designer(s) deja traites", len(import_state))
+
     seen_ids: set[str] = set()
     id_to_gid: dict[str, str] = {}
 
@@ -372,9 +411,27 @@ def import_designers(
 
         # Ne créer qu'un seul metaobject par designer (on prend la première occurrence = FR)
         if wee_id in seen_ids:
-            logger.debug("Designer %s (%s) déjà traité — ignoré.", wee_id, langue)
+            logger.debug("Designer %s (%s) deja traite — ignore.", wee_id, langue)
             continue
         seen_ids.add(wee_id)
+
+        # Reprise : skip si deja traite avec un vrai GID Shopify
+        if wee_id in import_state:
+            cached_gid = import_state[wee_id].get("shopify_metaobject_gid", "")
+            if cached_gid and not cached_gid.startswith("[DRY-RUN"):
+                logger.info(
+                    "Designer %s deja traite (cache) — GID : %s", wee_id, cached_gid[:50]
+                )
+                id_to_gid[wee_id] = cached_gid
+                report.add(
+                    wee_designer_id=wee_id,
+                    langue=langue,
+                    action_metaobject="skipped",
+                    shopify_metaobject_gid=cached_gid,
+                    statut="ok",
+                    message="reprise depuis cache",
+                )
+                continue
 
         image_gid = _resolve_image_gid(
             row=row,
@@ -411,6 +468,16 @@ def import_designers(
                 statut="ok",
             )
 
+            # Sauvegarder l'état immédiatement après chaque designer
+            import_state[wee_id] = {
+                "wee_designer_id": wee_id,
+                "shopify_metaobject_gid": gid or "",
+                "image_status": "ok" if image_gid else "no_image",
+                "product_status": "",
+                "processed_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            _save_designer_state(import_state, state_path)
+
         except ShopifyGraphQLError as e:
             logger.error("Erreur metaobject designer %s : %s", wee_id, e)
             report.add(
@@ -420,6 +487,15 @@ def import_designers(
                 statut="error",
                 message=str(e),
             )
+            # Enregistrer l'erreur dans le state pour ne pas re-bloquer indéfiniment
+            import_state[wee_id] = {
+                "wee_designer_id": wee_id,
+                "shopify_metaobject_gid": "",
+                "image_status": "ok" if image_gid else "no_image",
+                "product_status": "error",
+                "processed_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            _save_designer_state(import_state, state_path)
 
     # Persister la carte GID images pour éviter re-uploads lors du prochain run
     if image_gid_cache:
@@ -514,6 +590,126 @@ def link_products(
             )
 
 
+# ── Aperçu (--preview) ───────────────────────────────────────────────────────
+
+_PREVIEW_COLUMNS = [
+    "wee_designer_id", "nom", "image_id", "image_status",
+    "metaobject_status", "wee_product_id", "product_status", "action_prevue",
+]
+
+
+def run_preview(
+    designers: list[dict],
+    links: list[dict],
+    output_dir: Path,
+    test_product_id: str | None,
+) -> None:
+    """
+    Mode lecture seule : analyse les CSV locaux sans appel API et génère
+    output/import_preview.csv avec un résumé console.
+    """
+    state_path = output_dir / "import_state.csv"
+    gid_map_path = output_dir / "image_gid_map.csv"
+
+    import_state = _load_import_state(state_path)
+    image_gid_map = _load_image_gid_map(gid_map_path)
+
+    # Filtrage mode test
+    if test_product_id:
+        relevant_ids = {
+            str(l["wee_designer_id"])
+            for l in links
+            if str(l["product_id"]) == test_product_id
+        }
+        designers = [d for d in designers if str(d["wee_designer_id"]) in relevant_ids]
+        links = [l for l in links if str(l["product_id"]) == test_product_id]
+
+    # Dédupliquer les designers (FR en priorité)
+    designers_sorted = sorted(
+        designers, key=lambda r: (0 if r.get("langue", "") == "fr_FR" else 1)
+    )
+    seen: set[str] = set()
+    unique_designers: list[dict] = []
+    for d in designers_sorted:
+        wid = str(d.get("wee_designer_id", ""))
+        if wid not in seen:
+            seen.add(wid)
+            unique_designers.append(d)
+
+    # Index liens : wee_designer_id → [wee_product_id, ...]
+    from collections import defaultdict
+    links_by_designer: dict[str, list[str]] = defaultdict(list)
+    for l in links:
+        links_by_designer[str(l["wee_designer_id"])].append(str(l["product_id"]))
+
+    # Détermine si la résolution produit est possible (mode test uniquement)
+    product_resolvable = bool(config.TEST_PRODUCT_SKU or config.TEST_PRODUCT_HANDLE)
+
+    preview_rows: list[dict] = []
+    for d in unique_designers:
+        wee_id = str(d.get("wee_designer_id", ""))
+        nom = d.get("nom", "")
+        image_id = str(d.get("image_id", ""))
+
+        image_status = "cache_ok" if image_id in image_gid_map else "a_uploader"
+
+        cached_entry = import_state.get(wee_id, {})
+        cached_gid = cached_entry.get("shopify_metaobject_gid", "")
+        in_state_ok = bool(cached_gid and not cached_gid.startswith("[DRY-RUN"))
+        metaobject_status = "existant_en_cache" if in_state_ok else "a_creer"
+        action_prevue = "skip" if in_state_ok else "create"
+
+        product_ids = links_by_designer.get(wee_id) or [""]
+        for pid in product_ids:
+            if pid and test_product_id:
+                product_status = "mappable" if product_resolvable else "mapping_manquant"
+            elif pid:
+                product_status = "a_verifier"
+            else:
+                product_status = ""
+            preview_rows.append({
+                "wee_designer_id": wee_id,
+                "nom": nom,
+                "image_id": image_id,
+                "image_status": image_status,
+                "metaobject_status": metaobject_status,
+                "wee_product_id": pid,
+                "product_status": product_status,
+                "action_prevue": action_prevue,
+            })
+
+    # Écriture CSV
+    preview_path = output_dir / "import_preview.csv"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with open(preview_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=_PREVIEW_COLUMNS)
+        writer.writeheader()
+        writer.writerows(preview_rows)
+
+    # Résumé console
+    total = len(unique_designers)
+    to_skip = sum(1 for d in unique_designers if import_state.get(str(d.get("wee_designer_id", "")), {}).get("shopify_metaobject_gid", "") and not import_state[str(d.get("wee_designer_id", ""))]["shopify_metaobject_gid"].startswith("[DRY-RUN"))
+    to_create = total - to_skip
+    img_cached = sum(1 for d in unique_designers if str(d.get("image_id", "")) in image_gid_map)
+    img_upload = total - img_cached
+    links_total = sum(1 for r in preview_rows if r["wee_product_id"])
+    mappable = sum(1 for r in preview_rows if r["product_status"] == "mappable")
+    missing = sum(1 for r in preview_rows if r["product_status"] == "mapping_manquant")
+
+    logger.info("=" * 60)
+    logger.info("APERCU (--preview) — aucune ecriture effectuee")
+    logger.info("  Designers total          : %d", total)
+    logger.info("  Metaobjects a creer      : %d", to_create)
+    logger.info("  Deja traites (cache)     : %d", to_skip)
+    logger.info("  Images en cache          : %d", img_cached)
+    logger.info("  Images a uploader        : %d", img_upload)
+    logger.info("  Liens produit total      : %d", links_total)
+    logger.info("  Liens mappables          : %d", mappable)
+    logger.info("  Liens sans mapping       : %d", missing)
+    logger.info("  Apercu genere : %s", preview_path)
+    logger.info("=" * 60)
+
+
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
@@ -552,6 +748,21 @@ def parse_args() -> argparse.Namespace:
         help="Active l'écriture réelle Shopify (IRRÉVERSIBLE)",
     )
 
+    # Utilitaires
+    parser.add_argument(
+        "--preview",
+        action="store_true",
+        default=False,
+        help="Aperçu lecture seule : génère import_preview.csv sans aucun appel API",
+    )
+    parser.add_argument(
+        "--reset-cache",
+        action="store_true",
+        dest="reset_cache",
+        default=False,
+        help="Supprime import_state.csv et image_gid_map.csv puis quitte",
+    )
+
     return parser.parse_args()
 
 
@@ -559,28 +770,31 @@ def main() -> None:
     setup_logging()
     args = parse_args()
 
-    # Le flag CLI surpasse le .env, le .env surpasse la valeur par défaut (True)
-    if args.dry_run_flag is not None:
-        dry_run = args.dry_run_flag
-    else:
-        dry_run = config.DRY_RUN
+    output_dir = config.OUTPUT_DIR
+
+    # ── --reset-cache : supprime les caches locaux puis quitte ────────────────
+    if args.reset_cache:
+        files_to_delete = [
+            output_dir / "import_state.csv",
+            output_dir / "image_gid_map.csv",
+        ]
+        for f in files_to_delete:
+            if f.exists():
+                f.unlink()
+                logger.info("Cache supprime : %s", f)
+            else:
+                logger.info("Cache absent (rien a supprimer) : %s", f)
+        logger.info("--reset-cache termine.")
+        return
 
     global_mode = getattr(args, "global_import", False)
     test_mode = not global_mode
 
-    if dry_run:
-        logger.info(">>> MODE DRY-RUN ACTIF — aucune écriture Shopify <<<")
-    else:
-        logger.warning(">>> MODE ÉCRITURE RÉELLE SHOPIFY — les modifications sont permanentes <<<")
-
-    output_dir = config.OUTPUT_DIR
+    output_dir.mkdir(parents=True, exist_ok=True)
     designers = read_csv(output_dir / "designers.csv")
     links = read_csv(output_dir / "product_designer_links.csv")
-    logger.info("Designers chargés : %d lignes", len(designers))
-    logger.info("Liens chargés     : %d lignes", len(links))
-
-    client = ShopifyClient(dry_run=dry_run)
-    report = ImportReport(output_dir)
+    logger.info("Designers charges : %d lignes", len(designers))
+    logger.info("Liens charges     : %d lignes", len(links))
 
     # Détermination du product_id de test
     test_product_id = config.TEST_PRODUCT_ID if test_mode else None
@@ -592,7 +806,29 @@ def main() -> None:
         )
         sys.exit(1)
 
-    logger.info("Périmètre : %s", f"test (product_id={test_product_id})" if test_mode else "global")
+    logger.info("Perimetre : %s", f"test (product_id={test_product_id})" if test_mode else "global")
+
+    # ── --preview : aperçu lecture seule, aucun appel API ────────────────────
+    if args.preview:
+        logger.info(">>> MODE PREVIEW — lecture seule, aucune ecriture <<<")
+        run_preview(designers, links, output_dir, test_product_id)
+        return
+
+    # ── Import normal ─────────────────────────────────────────────────────────
+
+    # Le flag CLI surpasse le .env, le .env surpasse la valeur par défaut (True)
+    if args.dry_run_flag is not None:
+        dry_run = args.dry_run_flag
+    else:
+        dry_run = config.DRY_RUN
+
+    if dry_run:
+        logger.info(">>> MODE DRY-RUN ACTIF — aucune ecriture Shopify <<<")
+    else:
+        logger.warning(">>> MODE ECRITURE REELLE SHOPIFY — les modifications sont permanentes <<<")
+
+    client = ShopifyClient(dry_run=dry_run)
+    report = ImportReport(output_dir)
 
     # Phase 1 — Metaobjects
     logger.info("--- Phase 1 : Import des metaobjects Designer ---")
