@@ -6,6 +6,9 @@ L'import Designer (import_designers_to_shopify.py) intègre lui-même la même
 logique de résolution image : ce script est optionnel mais pratique pour
 traiter les images en avance et pré-remplir image_gid_map.csv.
 
+Clé de cache : str(image_id) — identique à import_designers_to_shopify.py.
+Nom Drive  : {image_id}.{image_ext} (ex: 197526.jpg).
+
 Usage :
   python upload_images_to_shopify.py           # tous les designers du CSV
   python upload_images_to_shopify.py --test    # uniquement le produit de test
@@ -108,14 +111,23 @@ def main() -> None:
         all_designers = [d for d in all_designers if str(d["wee_designer_id"]) in relevant_ids]
         logger.info("Mode test : %d designer(s) pour product_id=%s", len(all_designers), config.TEST_PRODUCT_ID)
 
-    unique_images = {d["image_file"] for d in all_designers if d.get("image_file")}
-    logger.info("Images uniques à traiter : %d", len(unique_images))
+    # Clé de cache = str(image_id) — même convention que import_designers_to_shopify.py
+    # Nom Drive    = {image_id}.{image_ext}
+    unique_id_to_filename: dict[str, str] = {}
+    for d in all_designers:
+        image_id = str(d.get("image_id", "")).strip()
+        image_ext = (d.get("image_ext", "") or "jpg").strip()
+        if image_id:
+            unique_id_to_filename[image_id] = f"{image_id}.{image_ext}"
 
-    # Carte existante
+    logger.info("Images uniques à traiter : %d", len(unique_id_to_filename))
+
+    # Carte existante (clé = image_id)
     gid_map = load_existing_map(gid_map_csv)
     sources: dict[str, str] = {}
-    to_process = unique_images - set(gid_map.keys())
-    logger.info("Déjà dans le cache : %d  |  À traiter : %d", len(unique_images) - len(to_process), len(to_process))
+    to_process = {k: v for k, v in unique_id_to_filename.items() if k not in gid_map}
+    logger.info("Déjà dans le cache : %d  |  À traiter : %d",
+                len(unique_id_to_filename) - len(to_process), len(to_process))
 
     if not to_process:
         logger.info("Toutes les images sont déjà en cache.")
@@ -128,28 +140,33 @@ def main() -> None:
         sys.exit(1)
     folder_id = google_drive.find_folder_id(drive, config.GOOGLE_DRIVE_FOLDER_NAME)
 
-    client = ShopifyClient(dry_run=False)
+    client = ShopifyClient(dry_run=args.dry_run)
     if args.dry_run:
         logger.info("[DRY-RUN] fileCreate désactivé.")
 
     ok_count = err_count = nf_count = 0
 
-    for filename in sorted(to_process):
-        logger.info("Traitement : %s", filename[:50])
+    for image_id, filename in sorted(to_process.items()):
+        logger.info("Traitement : %s", filename)
+
+        if args.dry_run:
+            found = google_drive.find_file(drive, filename, folder_id)
+            if found:
+                logger.info("  [DRY-RUN] Trouvée dans Drive — upload simulé.")
+                ok_count += 1
+            else:
+                logger.warning("  [DRY-RUN] Introuvable dans Drive : %s", filename)
+                nf_count += 1
+            continue
 
         # Téléchargement Drive
         file_bytes = google_drive.download_file(drive, filename, folder_id)
         if not file_bytes:
-            logger.warning("  Introuvable dans Drive : %s", filename[:50])
+            logger.warning("  Introuvable dans Drive : %s", filename)
             nf_count += 1
             continue
 
         logger.info("  Drive : %d Ko téléchargés", len(file_bytes) // 1024)
-
-        if args.dry_run:
-            logger.info("  [DRY-RUN] Upload ignoré.")
-            ok_count += 1
-            continue
 
         # Upload Shopify
         try:
@@ -160,8 +177,8 @@ def main() -> None:
             continue
 
         if gid:
-            gid_map[filename] = gid
-            sources[filename] = "google_drive"
+            gid_map[image_id] = gid
+            sources[image_id] = "google_drive"
             logger.info("  GID Shopify : %s", gid)
             ok_count += 1
         else:
@@ -177,9 +194,9 @@ def main() -> None:
                 client.wait_for_file_ready(gid, max_attempts=8, delay=2.0)
 
     # Conserver les entrées existantes
-    for fname, gid in load_existing_map(gid_map_csv).items():
-        if fname not in gid_map:
-            gid_map[fname] = gid
+    for key, gid in load_existing_map(gid_map_csv).items():
+        if key not in gid_map:
+            gid_map[key] = gid
 
     save_map(gid_map, sources, gid_map_csv)
 

@@ -30,6 +30,7 @@ import argparse
 import csv
 import logging
 import sys
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -227,13 +228,15 @@ def _load_import_state(path: Path) -> dict[str, dict]:
         return {row["wee_designer_id"]: row for row in csv.DictReader(f)}
 
 
-def _save_designer_state(state: dict[str, dict], path: Path) -> None:
-    """Persiste l'état complet dans import_state.csv (appelé après chaque designer)."""
+def _append_designer_state(entry: dict, path: Path) -> None:
+    """Ajoute une ligne dans import_state.csv (append — O(1) au lieu de O(n²))."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", newline="", encoding="utf-8") as f:
+    write_header = not path.exists()
+    with open(path, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=_STATE_COLUMNS)
-        writer.writeheader()
-        writer.writerows(state.values())
+        if write_header:
+            writer.writeheader()
+        writer.writerow(entry)
 
 
 # ── State cache Phase 2 (liens produit) ──────────────────────────────────────
@@ -300,9 +303,8 @@ def _resolve_image_gid(
         return None
 
     cache_key = str(image_id)
-    id_filename = f"{image_id}.{image_ext}"                     # ex: 197526.jpg
-    hash_path = _file_hash_path(image_id, image_ext)            # ex: 0000/0197/197526.jpg
-    drive_search_names = [id_filename, hash_path.split("/")[-1]] # [197526.jpg]
+    id_filename = f"{image_id}.{image_ext}"  # ex: 197526.jpg
+    drive_search_names = [id_filename]        # Drive : cherche par ID numérique uniquement
 
     # 1. Cache local
     if cache_key in gid_map:
@@ -321,7 +323,7 @@ def _resolve_image_gid(
 
     # 3. IMAGE_BASE_URL → Shopify télécharge directement l'image
     if config.IMAGE_BASE_URL:
-        # On essaie d'abord le chemin ID-based, puis signature
+        hash_path = _file_hash_path(image_id, image_ext)  # ex: 0000/0197/197526.jpg
         for url_path in [hash_path, id_filename, image_file]:
             if not url_path:
                 continue
@@ -537,15 +539,16 @@ def import_designers(
                 statut="ok",
             )
 
-            # Sauvegarder l'état immédiatement après chaque designer
-            import_state[wee_id] = {
+            # Sauvegarder l'état immédiatement après chaque designer (append O(1))
+            entry = {
                 "wee_designer_id": wee_id,
                 "shopify_metaobject_gid": gid or "",
                 "image_status": "ok" if image_gid else "no_image",
                 "product_status": "",
                 "processed_at": datetime.now().isoformat(timespec="seconds"),
             }
-            _save_designer_state(import_state, state_path)
+            import_state[wee_id] = entry
+            _append_designer_state(entry, state_path)
 
         except ShopifyGraphQLError as e:
             logger.error("Erreur metaobject designer %s : %s", wee_id, e)
@@ -556,15 +559,16 @@ def import_designers(
                 statut="error",
                 message=str(e),
             )
-            # Enregistrer l'erreur dans le state pour ne pas re-bloquer indéfiniment
-            import_state[wee_id] = {
+            # Enregistrer l'erreur dans le state (append O(1))
+            entry = {
                 "wee_designer_id": wee_id,
                 "shopify_metaobject_gid": "",
                 "image_status": "ok" if image_gid else "no_image",
                 "product_status": "error",
                 "processed_at": datetime.now().isoformat(timespec="seconds"),
             }
-            _save_designer_state(import_state, state_path)
+            import_state[wee_id] = entry
+            _append_designer_state(entry, state_path)
 
     if skipped_from_cache:
         logger.info("Phase 1 : %d designer(s) repris depuis le cache (aucun appel API).", skipped_from_cache)
@@ -673,7 +677,7 @@ def link_products(
             report.add(
                 wee_designer_id=wee_designer_id,
                 wee_product_id=wee_product_id,
-                shopify_product_gid=product_gid or "",
+                shopify_product_gid=product_gid,
                 action_metafield="error",
                 statut="error",
                 message=str(e),
@@ -734,7 +738,6 @@ def run_preview(
             unique_designers.append(d)
 
     # Index liens : wee_designer_id → [wee_product_id, ...]
-    from collections import defaultdict
     links_by_designer: dict[str, list[str]] = defaultdict(list)
     for l in links:
         links_by_designer[str(l["wee_designer_id"])].append(str(l["product_id"]))
@@ -743,16 +746,22 @@ def run_preview(
     product_resolvable = bool(config.TEST_PRODUCT_SKU or config.TEST_PRODUCT_HANDLE)
 
     preview_rows: list[dict] = []
+    to_skip = 0
+    img_cached = 0
     for d in unique_designers:
         wee_id = str(d.get("wee_designer_id", ""))
         nom = d.get("nom", "")
         image_id = str(d.get("image_id", ""))
 
         image_status = "cache_ok" if image_id in image_gid_map else "a_uploader"
+        if image_status == "cache_ok":
+            img_cached += 1
 
         cached_entry = import_state.get(wee_id, {})
         cached_gid = cached_entry.get("shopify_metaobject_gid", "")
         in_state_ok = bool(cached_gid and not cached_gid.startswith("[DRY-RUN"))
+        if in_state_ok:
+            to_skip += 1
         metaobject_status = "existant_en_cache" if in_state_ok else "a_creer"
         action_prevue = "skip" if in_state_ok else "create"
 
@@ -785,9 +794,7 @@ def run_preview(
 
     # Résumé console
     total = len(unique_designers)
-    to_skip = sum(1 for d in unique_designers if import_state.get(str(d.get("wee_designer_id", "")), {}).get("shopify_metaobject_gid", "") and not import_state[str(d.get("wee_designer_id", ""))]["shopify_metaobject_gid"].startswith("[DRY-RUN"))
     to_create = total - to_skip
-    img_cached = sum(1 for d in unique_designers if str(d.get("image_id", "")) in image_gid_map)
     img_upload = total - img_cached
     links_total = sum(1 for r in preview_rows if r["wee_product_id"])
     mappable = sum(1 for r in preview_rows if r["product_status"] == "mappable")

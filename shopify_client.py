@@ -127,34 +127,6 @@ class ShopifyClient:
         logger.warning("Aucun produit Shopify trouvé pour handle : %s", handle)
         return None
 
-    def find_product_by_wee_id(self, wee_product_id: str) -> str | None:
-        """
-        Cherche un produit Shopify via le metafield custom.wee_product_id.
-        À utiliser quand les produits ont déjà été migrés avec cet identifiant.
-        """
-        query = """
-        query FindByWeeId($namespace: String!, $key: String!, $value: String!) {
-          products(first: 1, query: $value) {
-            edges {
-              node {
-                id
-                metafield(namespace: $namespace, key: $key) {
-                  value
-                }
-              }
-            }
-          }
-        }
-        """
-        # Note : la recherche full-text Shopify ne filtre pas sur les metafields directement.
-        # Cette implémentation est un placeholder — en production, maintenez une table
-        # de correspondance wee_product_id ↔ shopify_gid dans un CSV séparé.
-        logger.warning(
-            "find_product_by_wee_id(%s) : non implémenté — utilisez un CSV de mapping.",
-            wee_product_id,
-        )
-        return None
-
     # ── Metaobjects ───────────────────────────────────────────────────────────
 
     def find_metaobject_by_wee_id(self, wee_designer_id: str) -> str | None:
@@ -202,9 +174,7 @@ class ShopifyClient:
         from pathlib import Path as _Path
         stem = _Path(filename).stem          # sans extension
         candidates = [filename, stem, stem[:40]]
-        # Dédoublonnage tout en préservant l'ordre
-        seen: set[str] = set()
-        search_terms = [c for c in candidates if c and c not in seen and not seen.add(c)]  # type: ignore[func-returns-value]
+        search_terms = list(dict.fromkeys(c for c in candidates if c))
 
         gql = """
         query FindFile($query: String!) {
@@ -240,18 +210,18 @@ class ShopifyClient:
         Pipeline complet : staged upload → POST S3 → fileCreate.
         Retourne le GID MediaImage ou None (dry-run / erreur).
         """
+        if self.dry_run:
+            logger.info("[DRY-RUN] Upload image ignoré : %s", filename[:40])
+            return None
+
         import mimetypes
         content_type = mimetypes.guess_type(filename)[0] or "image/jpeg"
 
-        # 1. Staged upload
+        # 1. Staged upload (création du target S3)
         target = self.staged_upload_create(filename, content_type, len(file_bytes))
         upload_url = target["url"]
         resource_url = target["resourceUrl"]
         params = {p["name"]: p["value"] for p in target["parameters"]}
-
-        if self.dry_run:
-            logger.info("[DRY-RUN] Upload image ignoré : %s", filename[:40])
-            return None
 
         # 2. POST binaire vers S3
         import requests as _req
@@ -467,9 +437,10 @@ class ShopifyClient:
             status = data.get("node", {}).get("fileStatus", "UNKNOWN")
             if status == "READY":
                 return True
-            if status in ("FAILED", "UPLOADED"):
-                logger.warning("Fichier %s statut inattendu : %s", gid, status)
-                return status != "FAILED"
+            if status == "FAILED":
+                logger.warning("Fichier %s en statut FAILED — upload échoué.", gid)
+                return False
+            # UPLOADING, UPLOADED, PROCESSING → état transitoire, on continue
             logger.debug("Fichier %s : %s (tentative %d/%d)", gid, status, attempt, max_attempts)
             time.sleep(delay)
         logger.warning("Fichier %s non prêt après %d tentatives.", gid, max_attempts)
