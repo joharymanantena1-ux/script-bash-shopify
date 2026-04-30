@@ -9,25 +9,30 @@ Deux stratégies (choisir selon votre situation) :
   --from-shopify
       Interroge Shopify pour tous les produits qui ont le metafield
       custom.wee_product_id déjà renseigné.
-      → Idéal si une migration précédente a taggué les produits Shopify
-        avec leur ID Wee.
 
   --from-db-handle
-      Lit les slugs/handles des produits dans la base MariaDB Wee,
-      puis charge tous les handles Shopify pour construire la correspondance.
-      → Idéal si les handles Shopify correspondent aux slugs Wee.
-      → Nécessite une table produit dans la DB (détectée automatiquement).
+      Lit les slugs des produits dans la base Wee (filtrés par la locale
+      par défaut), normalise les accents, puis croise avec les handles
+      Shopify pour construire la correspondance.
+
+Diagnostic :
+
+  --diagnose
+      Montre des exemples de slugs DB vs handles Shopify pour comprendre
+      les divergences SANS écrire de fichier (lecture seule).
 
 Usage :
-  python build_product_mapping.py --from-shopify
+  python build_product_mapping.py --diagnose
+  python build_product_mapping.py --from-db-handle --dry-run
   python build_product_mapping.py --from-db-handle
-  python build_product_mapping.py --from-shopify --dry-run
+  python build_product_mapping.py --from-shopify
 """
 
 import argparse
 import csv
 import logging
 import sys
+import unicodedata
 from pathlib import Path
 
 import config
@@ -57,14 +62,27 @@ logger = logging.getLogger(__name__)
 _MAP_COLUMNS = ["wee_product_id", "shopify_product_gid", "source"]
 
 
+# ── Normalisation slug ────────────────────────────────────────────────────────
+
+def normalize_handle(s: str) -> str:
+    """
+    Normalise un slug/handle pour le matching :
+    - Supprime les accents (é→e, à→a, ü→u…)
+    - Minuscules
+    - Espaces et underscores → tirets
+    Identique à ce que Shopify fait sur les handles.
+    """
+    nfkd = unicodedata.normalize("NFKD", s)
+    no_accents = "".join(c for c in nfkd if not unicodedata.combining(c))
+    return no_accents.lower().replace(" ", "-").replace("_", "-")
+
+
+# ── CSV ───────────────────────────────────────────────────────────────────────
+
 def save_mapping(mapping: dict[str, str], sources: dict[str, str], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     rows = [
-        {
-            "wee_product_id": wid,
-            "shopify_product_gid": gid,
-            "source": sources.get(wid, ""),
-        }
+        {"wee_product_id": wid, "shopify_product_gid": gid, "source": sources.get(wid, "")}
         for wid, gid in sorted(mapping.items(), key=lambda x: int(x[0]) if x[0].isdigit() else 0)
     ]
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -81,27 +99,130 @@ def load_existing_mapping(path: Path) -> dict[str, str]:
         return {row["wee_product_id"]: row["shopify_product_gid"] for row in csv.DictReader(f)}
 
 
+# ── Détection table produit DB ────────────────────────────────────────────────
+
+def detect_product_table(conn) -> dict | None:
+    """
+    Détecte la table produit dans la DB Wee.
+    Retourne un dict avec :
+      table      : nom de la table
+      slug_col   : colonne contenant le slug/handle
+      id_col     : colonne qui référence le product_id
+      has_locale : True si la table a une colonne trans_id ou locale
+    """
+    from db import fetch_all
+
+    # Quelles colonnes existent dans les tables candidates ?
+    rows = fetch_all(
+        conn,
+        """
+        SELECT TABLE_NAME, COLUMN_NAME
+        FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = ?
+          AND TABLE_NAME IN ('product', 'products', 'product_trans', 'shop_product')
+        ORDER BY TABLE_NAME, COLUMN_NAME
+        """,
+        (config.DB_NAME,),
+    )
+    if not rows:
+        return None
+
+    cols_by_table: dict[str, set] = {}
+    for r in rows:
+        cols_by_table.setdefault(r["TABLE_NAME"], set()).add(r["COLUMN_NAME"])
+
+    # Essaie les tables dans l'ordre de priorité
+    candidates = [
+        ("product_trans", "slug"),
+        ("product_trans", "handle"),
+        ("product", "slug"),
+        ("product", "handle"),
+        ("product", "url_key"),
+        ("products", "slug"),
+        ("products", "handle"),
+    ]
+    for table, slug_col in candidates:
+        table_cols = cols_by_table.get(table, set())
+        if slug_col not in table_cols:
+            continue
+
+        # Détermine la colonne FK vers le produit
+        if table == "product":
+            id_col = "id"
+        else:
+            # Pour product_trans, cherche product_id
+            id_col = "product_id" if "product_id" in table_cols else "id"
+
+        # Détecte si la table a une colonne locale/trans_id
+        has_locale = bool({"trans_id", "locale", "lang_id", "lang"} & table_cols)
+
+        return {
+            "table": table,
+            "slug_col": slug_col,
+            "id_col": id_col,
+            "has_locale": has_locale,
+            "all_cols": table_cols,
+        }
+
+    return None
+
+
+def fetch_slugs_from_db(conn, info: dict, product_ids: list[str]) -> dict[str, str]:
+    """
+    Retourne {wee_product_id: slug} en filtrant par locale si possible.
+    """
+    from db import fetch_all
+
+    table = info["table"]
+    slug_col = info["slug_col"]
+    id_col = info["id_col"]
+    has_locale = info["has_locale"]
+
+    slug_by_id: dict[str, str] = {}
+    batch_size = 500
+
+    for i in range(0, len(product_ids), batch_size):
+        batch = product_ids[i: i + batch_size]
+        placeholders = ",".join("?" * len(batch))
+
+        if has_locale and "trans_id" in info["all_cols"]:
+            # Filtre par trans_id (locale FR par défaut)
+            sql = (
+                f"SELECT {id_col} AS pid, {slug_col} AS slug "
+                f"FROM {table} "
+                f"WHERE {id_col} IN ({placeholders}) AND trans_id = ?"
+            )
+            params = tuple(batch) + (config.DEFAULT_TRANS_ID,)
+        else:
+            sql = (
+                f"SELECT {id_col} AS pid, {slug_col} AS slug "
+                f"FROM {table} "
+                f"WHERE {id_col} IN ({placeholders})"
+            )
+            params = tuple(batch)
+
+        rows = fetch_all(conn, sql, params)
+        for r in rows:
+            pid = str(r["pid"])
+            slug = str(r["slug"] or "").strip()
+            if slug and pid not in slug_by_id:
+                slug_by_id[pid] = slug
+
+    return slug_by_id
+
+
 # ── Stratégie A : depuis les metafields Shopify ───────────────────────────────
 
 def build_from_shopify(client: ShopifyClient, links_path: Path) -> dict[str, str]:
-    """
-    Interroge Shopify pour tous les produits ayant custom.wee_product_id.
-    Retourne {wee_product_id: shopify_gid}.
-    """
     logger.info("Stratégie : lecture metafield custom.wee_product_id depuis Shopify...")
-    logger.info("(Cette opération peut prendre plusieurs minutes selon le nombre de produits)")
-
+    logger.info("(Peut prendre plusieurs minutes)")
     mapping = client.list_all_products_with_wee_id()
     logger.info("Produits avec custom.wee_product_id : %d", len(mapping))
-
     if not mapping:
         logger.warning(
             "Aucun produit Shopify n'a le metafield custom.wee_product_id.\n"
-            "  → Essayez --from-db-handle si les handles Shopify correspondent aux slugs Wee.\n"
-            "  → Ou ajoutez manuellement wee_product_id dans les metafields Shopify."
+            "Essayez : python build_product_mapping.py --from-db-handle"
         )
-
-    # Comptage des wee_product_ids dans les liens pour comparer la couverture
     if links_path.exists():
         with open(links_path, "r", encoding="utf-8") as f:
             all_wee_ids = {row["product_id"] for row in csv.DictReader(f)}
@@ -111,63 +232,19 @@ def build_from_shopify(client: ShopifyClient, links_path: Path) -> dict[str, str
             covered, len(all_wee_ids),
             100 * covered / len(all_wee_ids) if all_wee_ids else 0,
         )
-
     return mapping
 
 
 # ── Stratégie B : depuis la DB Wee (slug/handle) ─────────────────────────────
 
-def detect_product_table(conn) -> tuple[str, str] | None:
-    """
-    Détecte automatiquement dans quelles tables/colonnes chercher les slugs produits.
-    Retourne (table_name, slug_column) ou None si non détecté.
-    """
-    from db import fetch_all
-
-    result = fetch_all(
-        conn,
-        """
-        SELECT TABLE_NAME, COLUMN_NAME
-        FROM information_schema.COLUMNS
-        WHERE TABLE_SCHEMA = ?
-          AND TABLE_NAME   IN ('product', 'products', 'product_trans', 'shop_product')
-          AND COLUMN_NAME  IN ('slug', 'handle', 'url_key', 'url_path', 'slug_fr', 'handle_fr')
-        ORDER BY TABLE_NAME, COLUMN_NAME
-        """,
-        (config.DB_NAME,),
-    )
-
-    if not result:
-        return None
-
-    # Priorité : table 'product' avec 'slug', puis autres combinaisons
-    priority = [
-        ("product", "slug"), ("product", "handle"), ("product", "url_key"),
-        ("product_trans", "slug"), ("product_trans", "handle"),
-        ("products", "slug"), ("products", "handle"),
-    ]
-    existing = {(r["TABLE_NAME"], r["COLUMN_NAME"]) for r in result}
-    for candidate in priority:
-        if candidate in existing:
-            return candidate
-
-    # Fallback : première entrée trouvée
-    r = result[0]
-    return (r["TABLE_NAME"], r["COLUMN_NAME"])
-
-
-def build_from_db_handle(
-    client: ShopifyClient,
-    links_path: Path,
-    mapping_path: Path,
-) -> dict[str, str]:
+def build_from_db_handle(client: ShopifyClient, links_path: Path) -> dict[str, str]:
     """
     1. Lit les product_id distincts depuis product_designer_links.csv
-    2. Cherche le slug/handle dans la DB Wee
+    2. Cherche les slugs dans la DB (filtrés par locale par défaut)
     3. Charge tous les handles Shopify (paginé, une seule passe)
-    4. Joint les deux pour construire la correspondance
+    4. Croise en normalisant les accents côté Wee
     """
-    from db import get_connection, fetch_all
+    from db import get_connection
 
     if not links_path.exists():
         logger.error("Fichier introuvable : %s — lancez d'abord export_designers_to_csv.py", links_path)
@@ -175,55 +252,54 @@ def build_from_db_handle(
 
     with open(links_path, "r", encoding="utf-8") as f:
         all_wee_ids = sorted({row["product_id"] for row in csv.DictReader(f) if row.get("product_id")})
-
     logger.info("Wee product_id distincts dans les liens : %d", len(all_wee_ids))
 
     with get_connection() as conn:
-        detected = detect_product_table(conn)
-        if not detected:
+        info = detect_product_table(conn)
+        if not info:
             logger.error(
-                "Aucune table produit détectée dans la DB (product, product_trans, products).\n"
-                "  Colonnes cherchées : slug, handle, url_key.\n"
-                "  Essayez --from-shopify à la place."
+                "Aucune table produit détectée dans la DB.\n"
+                "Tables cherchées : product, product_trans, products.\n"
+                "Colonnes cherchées : slug, handle, url_key."
             )
             sys.exit(1)
 
-        table, col = detected
-        logger.info("Table produit détectée : %s.%s", table, col)
+        logger.info(
+            "Table produit détectée : %s.%s (id_col=%s, has_locale=%s)",
+            info["table"], info["slug_col"], info["id_col"], info["has_locale"],
+        )
+        if info["has_locale"]:
+            logger.info("  Filtrage par locale : trans_id=%s (DEFAULT_TRANS_ID)", config.DEFAULT_TRANS_ID)
 
-        # Requête par batch de 500 IDs max pour ne pas saturer le SQL
-        slug_by_id: dict[str, str] = {}
-        batch_size = 500
-        for i in range(0, len(all_wee_ids), batch_size):
-            batch = all_wee_ids[i: i + batch_size]
-            placeholders = ",".join("?" * len(batch))
-            sql = f"SELECT id, {col} AS slug FROM {table} WHERE id IN ({placeholders})"
-            rows = fetch_all(conn, sql, tuple(batch))
-            for r in rows:
-                if r.get("slug"):
-                    slug_by_id[str(r["id"])] = str(r["slug"])
+        slug_by_id = fetch_slugs_from_db(conn, info, all_wee_ids)
 
     logger.info("Slugs trouvés dans la DB : %d / %d", len(slug_by_id), len(all_wee_ids))
-
-    missing_slugs = len(all_wee_ids) - len(slug_by_id)
-    if missing_slugs:
-        logger.warning("%d produit(s) sans slug dans la DB — ils ne seront pas mappés.", missing_slugs)
+    if len(all_wee_ids) - len(slug_by_id):
+        logger.warning(
+            "%d produit(s) sans slug dans la DB — ils ne seront pas mappés.",
+            len(all_wee_ids) - len(slug_by_id),
+        )
 
     if not slug_by_id:
-        logger.error("Aucun slug trouvé — impossible de construire le mapping.")
+        logger.error("Aucun slug trouvé. Vérifiez DEFAULT_TRANS_ID dans .env ou essayez --diagnose.")
         sys.exit(1)
 
-    # Charge tous les handles Shopify en une passe
-    logger.info("Chargement de tous les handles Shopify (paginé)...")
+    # Charge tous les handles Shopify en une passe (50K+ produits ≈ 3-4 min)
+    logger.info("Chargement de tous les handles Shopify (paginé, ~3-4 min)...")
     shopify_handles = client.list_all_products_by_handle()
     logger.info("Produits Shopify chargés : %d", len(shopify_handles))
 
-    # Croise : slug Wee → handle Shopify → GID
+    # Index normalisé des handles Shopify pour le matching insensible aux accents
+    shopify_normalized: dict[str, str] = {normalize_handle(h): gid for h, gid in shopify_handles.items()}
+
+    # Croise : slug Wee → handle Shopify (exact d'abord, normalisé ensuite)
     mapping: dict[str, str] = {}
     for wee_id, slug in slug_by_id.items():
-        # Essaie le slug tel quel, puis la version normalisée (minuscules, tirets)
-        normalized = slug.lower().replace(" ", "-").replace("_", "-")
-        gid = shopify_handles.get(slug) or shopify_handles.get(normalized)
+        gid = (
+            shopify_handles.get(slug)
+            or shopify_handles.get(normalize_handle(slug))
+            or shopify_normalized.get(normalize_handle(slug))
+        )
         if gid:
             mapping[wee_id] = gid
 
@@ -234,19 +310,111 @@ def build_from_db_handle(
         100 * matched / len(all_wee_ids) if all_wee_ids else 0,
     )
 
-    unmatched = [wid for wid in all_wee_ids if wid not in mapping]
-    if unmatched:
+    # Diagnostic des non-correspondances
+    unmatched_with_slug = [wid for wid in slug_by_id if wid not in mapping]
+    if unmatched_with_slug:
         logger.warning(
-            "%d produit(s) sans correspondance Shopify. Exemples : %s",
-            len(unmatched), unmatched[:10],
+            "%d produit(s) ont un slug en DB mais aucune correspondance Shopify.",
+            len(unmatched_with_slug),
         )
-        logger.warning(
-            "  Cause possible : le slug Wee ne correspond pas au handle Shopify.\n"
-            "  Exemple slug DB : '%s' — vérifiez le handle dans Shopify Admin.",
-            slug_by_id.get(unmatched[0], "?") if unmatched else "?",
-        )
+        logger.warning("  Exemples de slugs DB sans match :")
+        for wid in unmatched_with_slug[:5]:
+            slug = slug_by_id[wid]
+            logger.warning("    wee_id=%s  slug_db='%s'  normalized='%s'", wid, slug, normalize_handle(slug))
+        logger.warning("  → Comparez avec vos handles Shopify Admin.")
+        logger.warning("  → Lancez --diagnose pour voir 20 exemples côte à côte.")
 
     return mapping
+
+
+# ── Mode diagnostic ───────────────────────────────────────────────────────────
+
+def run_diagnose(client: ShopifyClient, links_path: Path) -> None:
+    """
+    Affiche des exemples côte à côte pour comprendre pourquoi les slugs
+    ne correspondent pas. Aucune écriture.
+    """
+    from db import get_connection
+
+    logger.info("=" * 60)
+    logger.info("MODE DIAGNOSTIC — lecture seule, aucune écriture")
+    logger.info("=" * 60)
+
+    # ── DB side ──
+    with open(links_path, "r", encoding="utf-8") as f:
+        all_wee_ids = sorted({row["product_id"] for row in csv.DictReader(f) if row.get("product_id")})
+
+    with get_connection() as conn:
+        info = detect_product_table(conn)
+        if not info:
+            logger.error("Aucune table produit détectée dans la DB.")
+            return
+
+        logger.info("Table produit : %s  |  colonne slug : %s  |  id_col : %s  |  has_locale : %s",
+                    info["table"], info["slug_col"], info["id_col"], info["has_locale"])
+        logger.info("Colonnes disponibles dans %s : %s", info["table"], sorted(info["all_cols"]))
+
+        # Exemples SANS filtre locale
+        from db import fetch_all
+        sample_ids = all_wee_ids[:20]
+        placeholders = ",".join("?" * len(sample_ids))
+        rows_no_filter = fetch_all(
+            conn,
+            f"SELECT {info['id_col']} AS pid, {info['slug_col']} AS slug FROM {info['table']} "
+            f"WHERE {info['id_col']} IN ({placeholders}) LIMIT 30",
+            tuple(sample_ids),
+        )
+
+        logger.info("-" * 60)
+        logger.info("SLUGS DB (sans filtre locale) — premiers résultats :")
+        for r in rows_no_filter[:15]:
+            logger.info("  pid=%-8s  slug='%s'", r["pid"], r["slug"])
+
+        # Exemples AVEC filtre locale si possible
+        if info["has_locale"] and "trans_id" in info["all_cols"]:
+            rows_with_locale = fetch_all(
+                conn,
+                f"SELECT {info['id_col']} AS pid, {info['slug_col']} AS slug FROM {info['table']} "
+                f"WHERE {info['id_col']} IN ({placeholders}) AND trans_id = ? LIMIT 30",
+                tuple(sample_ids) + (config.DEFAULT_TRANS_ID,),
+            )
+            logger.info("-" * 60)
+            logger.info("SLUGS DB (filtré trans_id=%s) :", config.DEFAULT_TRANS_ID)
+            for r in rows_with_locale[:15]:
+                logger.info("  pid=%-8s  slug='%s'  normalized='%s'", r["pid"], r["slug"], normalize_handle(str(r["slug"] or "")))
+
+            # Détecte quelles trans_id existent
+            trans_ids = fetch_all(
+                conn,
+                f"SELECT DISTINCT trans_id, COUNT(*) AS cnt FROM {info['table']} GROUP BY trans_id ORDER BY cnt DESC LIMIT 10",
+            )
+            logger.info("-" * 60)
+            logger.info("trans_id disponibles dans %s :", info["table"])
+            for t in trans_ids:
+                logger.info("  trans_id=%-4s  %d lignes", t["trans_id"], t["cnt"])
+
+    # ── Shopify side ──
+    logger.info("-" * 60)
+    logger.info("Chargement de 250 handles Shopify (première page)...")
+    gql = """
+    query {
+      products(first: 20, sortKey: CREATED_AT) {
+        edges { node { id handle } }
+      }
+    }
+    """
+    data = client._run(gql)
+    edges = data.get("products", {}).get("edges", [])
+    logger.info("HANDLES SHOPIFY (20 premiers produits créés) :")
+    for e in edges:
+        h = e["node"]["handle"]
+        logger.info("  handle='%s'  normalized='%s'", h, normalize_handle(h))
+
+    logger.info("=" * 60)
+    logger.info("INTERPRÉTATION :")
+    logger.info("  Si les slugs DB ressemblent aux handles Shopify → --from-db-handle fonctionnera.")
+    logger.info("  Si les formats sont complètement différents → mapping manuel ou autre stratégie.")
+    logger.info("  Vérifiez le bon trans_id ci-dessus (DEFAULT_TRANS_ID=%s dans .env).", config.DEFAULT_TRANS_ID)
 
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
@@ -255,18 +423,24 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Construit product_mapping.csv (wee_product_id → shopify_gid)"
     )
-    strategy = parser.add_mutually_exclusive_group(required=True)
-    strategy.add_argument(
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument(
         "--from-shopify",
         action="store_true",
         dest="from_shopify",
         help="Lit custom.wee_product_id depuis les metafields Shopify",
     )
-    strategy.add_argument(
+    mode.add_argument(
         "--from-db-handle",
         action="store_true",
         dest="from_db",
         help="Lit les slugs dans la DB Wee et les associe aux handles Shopify",
+    )
+    mode.add_argument(
+        "--diagnose",
+        action="store_true",
+        dest="diagnose",
+        help="Affiche des exemples slugs DB vs handles Shopify pour comprendre les écarts",
     )
     parser.add_argument(
         "--dry-run",
@@ -287,18 +461,26 @@ def main() -> None:
 
     client = ShopifyClient(dry_run=False)
 
+    if args.diagnose:
+        if not links_path.exists():
+            logger.error("Lancez d'abord : python export_designers_to_csv.py --global-export")
+            sys.exit(1)
+        run_diagnose(client, links_path)
+        return
+
     if args.from_shopify:
         mapping = build_from_shopify(client, links_path)
         source_label = "shopify_metafield"
     else:
-        mapping = build_from_db_handle(client, links_path, mapping_path)
+        mapping = build_from_db_handle(client, links_path)
         source_label = "db_handle"
 
     logger.info("=" * 60)
     logger.info("RÉSULTAT : %d correspondance(s) trouvée(s)", len(mapping))
 
     if not mapping:
-        logger.warning("Aucune correspondance trouvée — product_mapping.csv non créé.")
+        logger.warning("Aucune correspondance — product_mapping.csv non créé.")
+        logger.warning("Lancez --diagnose pour comprendre les écarts.")
         return
 
     if args.dry_run:
@@ -308,11 +490,9 @@ def main() -> None:
         logger.info("[DRY-RUN] product_mapping.csv non écrit.")
         return
 
-    # Fusionner avec le mapping existant (sans écraser les entrées valides)
     existing = load_existing_mapping(mapping_path)
     merged = {**existing, **mapping}
     sources = {wid: source_label for wid in mapping}
-
     save_mapping(merged, sources, mapping_path)
 
     logger.info("Prochaine étape :")
