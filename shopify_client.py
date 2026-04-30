@@ -570,6 +570,43 @@ class ShopifyClient:
             cursor = page_info["endCursor"]
         return mapping
 
+    def list_all_variants_by_barcode(self) -> dict[str, str]:
+        """
+        Retourne {barcode: shopify_product_gid} pour tous les variants Shopify (paginé).
+        Utile pour matcher les EAN13 de la DB Wee avec les barcodes Shopify.
+        """
+        query = """
+        query GetVariantBarcodes($after: String) {
+          productVariants(first: 250, after: $after) {
+            edges {
+              node {
+                barcode
+                product { id }
+              }
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+        """
+        mapping: dict[str, str] = {}
+        cursor = None
+        page = 0
+        while True:
+            page += 1
+            data = self._run(query, {"after": cursor})
+            result = data.get("productVariants", {})
+            for edge in result.get("edges", []):
+                node = edge["node"]
+                barcode = (node.get("barcode") or "").strip()
+                if barcode and barcode not in mapping:
+                    mapping[barcode] = node["product"]["id"]
+            page_info = result.get("pageInfo", {})
+            logger.debug("Page %d barcodes : %d entrée(s) chargées", page, len(mapping))
+            if not page_info.get("hasNextPage"):
+                break
+            cursor = page_info["endCursor"]
+        return mapping
+
     def list_all_variants_by_sku(self) -> dict[str, str]:
         """
         Retourne {sku: shopify_product_gid} pour tous les variants Shopify (paginé).

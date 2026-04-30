@@ -4,7 +4,7 @@ build_product_mapping.py — Construit output/product_mapping.csv
 Mappe wee_product_id → shopify_product_gid pour que la Phase 2 de
 import_designers_to_shopify.py puisse lier tous les produits.
 
-Deux stratégies (choisir selon votre situation) :
+Stratégies disponibles :
 
   --from-shopify
       Interroge Shopify pour tous les produits qui ont le metafield
@@ -15,6 +15,11 @@ Deux stratégies (choisir selon votre situation) :
       par défaut), normalise les accents, puis croise avec les handles
       Shopify pour construire la correspondance.
 
+  --from-db-ean
+      Lit les EAN13 de la table `product` Wee, puis croise avec les
+      barcodes des variants Shopify. Meilleure stratégie si Shopify
+      stocke les EAN13 dans le champ barcode des variants.
+
 Diagnostic :
 
   --diagnose
@@ -23,7 +28,8 @@ Diagnostic :
 
 Usage :
   python build_product_mapping.py --diagnose
-  python build_product_mapping.py --from-db-handle --dry-run
+  python build_product_mapping.py --from-db-ean --dry-run
+  python build_product_mapping.py --from-db-ean
   python build_product_mapping.py --from-db-handle
   python build_product_mapping.py --from-shopify
 """
@@ -293,6 +299,102 @@ def build_from_db_sku(client: ShopifyClient, links_path: Path) -> dict[str, str]
     if unmatched_with_sku:
         logger.warning("%d produit(s) ont un SKU en DB mais aucune correspondance Shopify.", len(unmatched_with_sku))
         logger.warning("  Exemples : %s", [(wid, sku_by_id[wid]) for wid in unmatched_with_sku[:5]])
+
+    return mapping
+
+
+# ── Stratégie D : depuis la DB Wee (EAN13 / barcode) ────────────────────────
+
+def build_from_db_ean(client: ShopifyClient, links_path: Path) -> dict[str, str]:
+    """
+    1. Lit les product_id distincts depuis product_designer_links.csv
+    2. Lit les EAN13 depuis la table `product` Wee (colonne ean13)
+    3. Charge tous les barcodes Shopify (paginé via productVariants)
+    4. Croise EAN13 DB ↔ barcode Shopify pour construire le mapping
+    """
+    from db import get_connection, fetch_all
+
+    if not links_path.exists():
+        logger.error("Fichier introuvable : %s — lancez d'abord export_designers_to_csv.py", links_path)
+        sys.exit(1)
+
+    with open(links_path, "r", encoding="utf-8") as f:
+        all_wee_ids = sorted({row["product_id"] for row in csv.DictReader(f) if row.get("product_id")})
+    logger.info("Wee product_id distincts dans les liens : %d", len(all_wee_ids))
+
+    # Lit les EAN13 depuis la table `product`
+    ean_by_id: dict[str, str] = {}
+    with get_connection() as conn:
+        # Vérifie que la colonne ean13 existe
+        cols = fetch_all(
+            conn,
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'product' AND COLUMN_NAME = 'ean13'",
+            (config.DB_NAME,),
+        )
+        if not cols:
+            logger.error(
+                "Colonne 'ean13' introuvable dans la table 'product'.\n"
+                "Essayez --diagnose pour voir les colonnes disponibles."
+            )
+            sys.exit(1)
+
+        batch_size = 500
+        for i in range(0, len(all_wee_ids), batch_size):
+            batch = all_wee_ids[i: i + batch_size]
+            placeholders = ",".join("?" * len(batch))
+            rows = fetch_all(
+                conn,
+                f"SELECT id AS pid, ean13 FROM product WHERE id IN ({placeholders}) AND ean13 IS NOT NULL AND ean13 != ''",
+                tuple(batch),
+            )
+            for r in rows:
+                pid = str(r["pid"])
+                ean = str(r["ean13"]).strip()
+                if ean and pid not in ean_by_id:
+                    ean_by_id[pid] = ean
+
+    logger.info("EAN13 trouvés dans la DB : %d / %d", len(ean_by_id), len(all_wee_ids))
+    if not ean_by_id:
+        logger.error("Aucun EAN13 trouvé. Vérifiez la table 'product' ou essayez --diagnose.")
+        sys.exit(1)
+
+    missing_ean = len(all_wee_ids) - len(ean_by_id)
+    if missing_ean:
+        logger.warning("%d produit(s) sans EAN13 dans la DB — ils ne seront pas mappés.", missing_ean)
+
+    # Charge tous les barcodes Shopify en une passe
+    logger.info("Chargement de tous les barcodes Shopify (paginé, ~3-4 min)...")
+    shopify_barcodes = client.list_all_variants_by_barcode()
+    logger.info("Variants Shopify avec barcode : %d", len(shopify_barcodes))
+
+    if not shopify_barcodes:
+        logger.error("Aucun barcode Shopify trouvé. Les variants ont-ils un champ 'Barcode' renseigné ?")
+        sys.exit(1)
+
+    # Croise EAN13 DB ↔ barcode Shopify
+    mapping: dict[str, str] = {}
+    for wee_id, ean in ean_by_id.items():
+        gid = shopify_barcodes.get(ean)
+        if gid:
+            mapping[wee_id] = gid
+
+    matched = len(mapping)
+    logger.info(
+        "Correspondances EAN13 trouvées : %d / %d wee_product_id(s) (%.1f%%)",
+        matched, len(all_wee_ids),
+        100 * matched / len(all_wee_ids) if all_wee_ids else 0,
+    )
+
+    unmatched_with_ean = [wid for wid in ean_by_id if wid not in mapping]
+    if unmatched_with_ean:
+        logger.warning(
+            "%d produit(s) ont un EAN13 en DB mais aucune correspondance Shopify.",
+            len(unmatched_with_ean),
+        )
+        logger.warning("  Exemples EAN13 DB sans match :")
+        for wid in unmatched_with_ean[:5]:
+            logger.warning("    wee_id=%s  ean13='%s'", wid, ean_by_id[wid])
 
     return mapping
 
@@ -576,25 +678,53 @@ def run_diagnose(client: ShopifyClient, links_path: Path) -> None:
                 else:
                     logger.info("  Aucune ligne pour les product_id %s dans '%s'.", pids, tname)
 
+    # ── EAN13 DB side ──
+    with get_connection() as conn:
+        from db import fetch_all as _fa
+        ean_cols = _fa(
+            conn,
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'product' "
+            "AND COLUMN_NAME IN ('ean13','ean','barcode','gtin')",
+            (config.DB_NAME,),
+        )
+        if ean_cols:
+            ean_col = ean_cols[0]["COLUMN_NAME"]
+            logger.info("-" * 60)
+            logger.info("EAN13 DB (colonne '%s' dans table 'product') — 10 exemples :", ean_col)
+            sample_pids = all_wee_ids[:10]
+            ph = ",".join(["?"] * len(sample_pids))
+            ean_rows = _fa(
+                conn,
+                f"SELECT id AS pid, {ean_col} FROM product WHERE id IN ({ph}) AND {ean_col} IS NOT NULL LIMIT 10",
+                tuple(sample_pids),
+            )
+            for r in ean_rows:
+                logger.info("  pid=%-8s  %s='%s'", r["pid"], ean_col, r[ean_col])
+        else:
+            logger.info("-" * 60)
+            logger.info("Aucune colonne EAN13/barcode détectée dans la table 'product'.")
+
     # ── Shopify side ──
     logger.info("-" * 60)
-    logger.info("SKUs SHOPIFY (20 premiers variants) :")
+    logger.info("SKUs ET BARCODES SHOPIFY (20 premiers variants) :")
     gql_skus = """
     query {
       productVariants(first: 20) {
-        edges { node { sku product { id handle } } }
+        edges { node { sku barcode product { id handle } } }
       }
     }
     """
     data = client._run(gql_skus)
     for e in data.get("productVariants", {}).get("edges", []):
         n = e["node"]
-        logger.info("  sku='%s'  product_handle='%s'", n.get("sku", ""), n["product"]["handle"])
+        logger.info("  sku='%s'  barcode='%s'  product_handle='%s'",
+                    n.get("sku", ""), n.get("barcode", ""), n["product"]["handle"])
 
     logger.info("=" * 60)
     logger.info("INTERPRÉTATION :")
-    logger.info("  Si une colonne DB (reference/sku) ressemble aux SKUs Shopify ci-dessus → --from-db-sku")
-    logger.info("  → Puis indiquez quelle table/colonne utiliser.")
+    logger.info("  Si les EAN13 DB ressemblent aux barcodes Shopify ci-dessus → --from-db-ean  (recommandé)")
+    logger.info("  Si une colonne DB (reference/sku) ressemble aux SKUs Shopify → --from-db-sku")
     logger.info("  DEFAULT_TRANS_ID=%s dans .env", config.DEFAULT_TRANS_ID)
 
 
@@ -622,6 +752,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         dest="from_db_sku",
         help="Lit account_id_for_unicity dans la DB Wee et le croise avec les SKUs Shopify",
+    )
+    mode.add_argument(
+        "--from-db-ean",
+        action="store_true",
+        dest="from_db_ean",
+        help="Lit les EAN13 dans la table product Wee et les croise avec les barcodes Shopify",
     )
     mode.add_argument(
         "--diagnose",
@@ -661,6 +797,9 @@ def main() -> None:
     elif args.from_db_sku:
         mapping = build_from_db_sku(client, links_path)
         source_label = "db_sku"
+    elif args.from_db_ean:
+        mapping = build_from_db_ean(client, links_path)
+        source_label = "db_ean"
     else:
         mapping = build_from_db_handle(client, links_path)
         source_label = "db_handle"
