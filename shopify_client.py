@@ -570,6 +570,65 @@ class ShopifyClient:
             cursor = page_info["endCursor"]
         return mapping
 
+    def set_metaobject_display_name_field(self, type_name: str, field_key: str) -> bool:
+        """
+        Met à jour la définition du metaobject pour utiliser field_key comme
+        displayNameField (le nom affiché dans Shopify Admin).
+        Retourne True si succès.
+        """
+        # 1. Récupère l'ID de la définition
+        query_def = """
+        query GetMetaobjectDef($type: String!) {
+          metaobjectDefinitionByType(type: $type) {
+            id
+            displayNameField
+          }
+        }
+        """
+        data = self._run(query_def, {"type": type_name})
+        defn = data.get("metaobjectDefinitionByType")
+        if not defn:
+            logger.error("Définition metaobject '%s' introuvable dans Shopify.", type_name)
+            return False
+
+        def_id = defn["id"]
+        current = defn.get("displayNameField")
+        logger.info("Définition '%s' : displayNameField actuel = '%s'", type_name, current)
+
+        if current == field_key:
+            logger.info("displayNameField déjà configuré sur '%s'. Rien à faire.", field_key)
+            return True
+
+        if self.dry_run:
+            logger.info("[DRY-RUN] metaobjectDefinitionUpdate ignoré (displayNameField → '%s').", field_key)
+            return True
+
+        # 2. Met à jour
+        mutation = """
+        mutation UpdateMetaobjectDef($id: ID!, $definition: MetaobjectDefinitionUpdateInput!) {
+          metaobjectDefinitionUpdate(id: $id, definition: $definition) {
+            metaobjectDefinition {
+              id
+              displayNameField
+            }
+            userErrors { field message }
+          }
+        }
+        """
+        result = self._run(mutation, {
+            "id": def_id,
+            "definition": {"displayNameKey": field_key},
+        })
+        update = result.get("metaobjectDefinitionUpdate", {})
+        errors = update.get("userErrors", [])
+        if errors:
+            logger.error("Erreur metaobjectDefinitionUpdate : %s", errors)
+            return False
+
+        new_field = (update.get("metaobjectDefinition") or {}).get("displayNameField")
+        logger.info("displayNameField mis à jour : '%s' → '%s'", current, new_field)
+        return True
+
     def list_all_variants_by_barcode(self) -> dict[str, str]:
         """
         Retourne {barcode: shopify_product_gid} pour tous les variants Shopify (paginé).
