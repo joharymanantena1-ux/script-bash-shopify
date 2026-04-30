@@ -531,6 +531,86 @@ class ShopifyClient:
             cursor = page_info["endCursor"]
         return gids
 
+    def list_all_designer_metaobjects_detailed(self) -> list[dict]:
+        """
+        Retourne la liste complète des metaobjects designer avec leurs champs.
+        Chaque dict : {id, wee_designer_id, name, has_image}
+        """
+        query = """
+        query ListDesignersDetailed($after: String) {
+          metaobjects(type: "designer", first: 250, after: $after) {
+            edges {
+              node {
+                id
+                wee_designer_id: field(key: "wee_designer_id") { value }
+                name_field:       field(key: "name")            { value }
+                image_field:      field(key: "image")           { value }
+              }
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+        """
+        results: list[dict] = []
+        cursor = None
+        while True:
+            data = self._run(query, {"after": cursor})
+            result = data.get("metaobjects", {})
+            for edge in result.get("edges", []):
+                node = edge["node"]
+                results.append({
+                    "id": node["id"],
+                    "wee_designer_id": (node.get("wee_designer_id") or {}).get("value", ""),
+                    "name": (node.get("name_field") or {}).get("value", ""),
+                    "has_image": bool((node.get("image_field") or {}).get("value", "")),
+                })
+            page_info = result.get("pageInfo", {})
+            if not page_info.get("hasNextPage"):
+                break
+            cursor = page_info["endCursor"]
+        return results
+
+    def list_all_products_with_designer_metafield(self) -> list[dict]:
+        """
+        Retourne [{product_id, metaobject_gid}] pour tous les produits
+        ayant le metafield custom.designer renseigné (paginé).
+        """
+        query = """
+        query GetProductsWithDesigner($after: String) {
+          products(first: 250, after: $after) {
+            edges {
+              node {
+                id
+                title
+                designer: metafield(namespace: "custom", key: "designer") { value }
+              }
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+        """
+        results: list[dict] = []
+        cursor = None
+        page = 0
+        while True:
+            page += 1
+            data = self._run(query, {"after": cursor})
+            result = data.get("products", {})
+            for edge in result.get("edges", []):
+                node = edge["node"]
+                mf = node.get("designer")
+                if mf and mf.get("value"):
+                    results.append({
+                        "product_id": node["id"],
+                        "metaobject_gid": mf["value"],
+                    })
+            page_info = result.get("pageInfo", {})
+            logger.debug("Page %d produits : %d avec designer", page, len(results))
+            if not page_info.get("hasNextPage"):
+                break
+            cursor = page_info["endCursor"]
+        return results
+
     # ── Listing produits (pour build_product_mapping) ─────────────────────────
 
     def list_all_products_with_wee_id(self) -> dict[str, str]:
