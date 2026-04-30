@@ -537,32 +537,44 @@ def run_diagnose(client: ShopifyClient, links_path: Path) -> None:
         if sku_cols:
             for r in sku_cols:
                 logger.info("  %s.%s  (%s)", r["TABLE_NAME"], r["COLUMN_NAME"], r["DATA_TYPE"])
-            # Montre des valeurs d'exemple pour la première table/colonne trouvée
-            first = sku_cols[0]
-            if all_wee_ids:
-                table_cols_check = fetch_all(
-                    conn,
-                    "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
-                    "WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
-                    (config.DB_NAME, first["TABLE_NAME"]),
-                )
-                table_col_names = {r["COLUMN_NAME"] for r in table_cols_check}
-                id_col_candidate = next(
-                    (c for c in ("product_id", "id_product", "id") if c in table_col_names), None
-                )
-                if id_col_candidate:
-                    sample_rows = fetch_all(
-                        conn,
-                        f"SELECT {id_col_candidate} AS pid, {first['COLUMN_NAME']} AS ref "
-                        f"FROM {first['TABLE_NAME']} "
-                        f"WHERE {id_col_candidate} IN ({','.join(['?']*min(5, len(all_wee_ids)))}) LIMIT 10",
-                        tuple(all_wee_ids[:5]),
-                    )
-                    logger.info("  Exemples valeurs %s.%s :", first["TABLE_NAME"], first["COLUMN_NAME"])
-                    for r in sample_rows:
-                        logger.info("    pid=%-8s  ref='%s'", r["pid"], r["ref"])
         else:
-            logger.warning("  Aucune colonne reference/sku/ean trouvée dans les tables produit.")
+            logger.warning("  Aucune colonne reference/sku/ean détectée (noms non-standard).")
+
+        # ── Colonnes détaillées des tables clés ──
+        key_tables = ["product", "supplier_product", "product_option"]
+        for tname in key_tables:
+            cols = fetch_all(
+                conn,
+                "SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS "
+                "WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
+                (config.DB_NAME, tname),
+            )
+            if not cols:
+                continue
+            col_names = [r["COLUMN_NAME"] for r in cols]
+            logger.info("-" * 60)
+            logger.info("COLONNES DE '%s' : %s", tname, col_names)
+
+            # Cherche la colonne id qui relie au product_id des liens
+            id_col = next((c for c in ("id", "product_id") if c in col_names), None)
+            if id_col and all_wee_ids:
+                n = min(3, len(all_wee_ids))
+                pids = all_wee_ids[:n]
+                ph = ",".join(["?"] * n)
+                sample = fetch_all(
+                    conn,
+                    f"SELECT * FROM {tname} WHERE {id_col} IN ({ph}) LIMIT 5",
+                    tuple(pids),
+                )
+                if sample:
+                    logger.info("  Exemples lignes (id/product_id = %s...) :", pids)
+                    for row in sample[:3]:
+                        # Affiche seulement les colonnes courtes/utiles
+                        preview = {k: v for k, v in row.items()
+                                   if v is not None and str(v)[:50] == str(v) and k not in ("description", "information")}
+                        logger.info("    %s", preview)
+                else:
+                    logger.info("  Aucune ligne pour les product_id %s dans '%s'.", pids, tname)
 
     # ── Shopify side ──
     logger.info("-" * 60)
