@@ -478,6 +478,7 @@ def import_designers(
 
     seen_ids: set[str] = set()
     id_to_gid: dict[str, str] = {}
+    designers_by_id: dict[str, dict] = {}
     skipped_from_cache = 0
 
     for row in designers:
@@ -489,6 +490,7 @@ def import_designers(
             logger.debug("Designer %s (%s) deja traite — ignore.", wee_id, langue)
             continue
         seen_ids.add(wee_id)
+        designers_by_id[wee_id] = row
 
         # Reprise : skip si deja traite avec un vrai GID Shopify
         if wee_id in import_state:
@@ -599,7 +601,7 @@ def import_designers(
     if image_gid_cache:
         _save_image_gid_map(image_gid_cache, image_sources, gid_map_path)
 
-    return id_to_gid, import_state, state_path
+    return id_to_gid, import_state, state_path, designers_by_id
 
 
 def link_products(
@@ -610,6 +612,7 @@ def link_products(
     test_product_id: str | None,
     import_state: dict | None = None,
     state_path: Path | None = None,
+    designers_by_id: dict | None = None,
 ) -> None:
     """
     Phase 2 : lie chaque produit Shopify à son metaobject designer via metafield.
@@ -710,25 +713,82 @@ def link_products(
             err_msg = str(e)
             if "Value must belong to the specified metaobject definition" in err_msg:
                 logger.warning(
-                    "GID obsolète pour designer %s (%s) — sera recréé au prochain run.",
+                    "GID obsolète pour designer %s (%s) — recréation immédiate...",
                     wee_designer_id, metaobject_gid,
                 )
                 stale_designers.add(wee_designer_id)
+                # Purge de l'ancien GID pour éviter les tentatives répétées
+                id_to_gid.pop(wee_designer_id, None)
                 if import_state and wee_designer_id in import_state:
                     del import_state[wee_designer_id]
+
+                # Recréation inline sans image (optionnelle)
+                row = (designers_by_id or {}).get(wee_designer_id)
+                if row:
+                    try:
+                        fields = designer_row_to_fields(row, image_gid=None)
+                        new_gid = client.create_metaobject(fields)
+                        if new_gid:
+                            id_to_gid[wee_designer_id] = new_gid
+                            metaobject_gid = new_gid
+                            if import_state is not None:
+                                import_state[wee_designer_id] = {
+                                    "wee_designer_id": wee_designer_id,
+                                    "shopify_metaobject_gid": new_gid,
+                                    "image_status": "",
+                                    "product_status": "",
+                                    "processed_at": "",
+                                }
+                            if state_path is not None:
+                                _append_designer_state(import_state[wee_designer_id], state_path)
+                            # Retry du lien avec le nouveau GID
+                            client.set_product_metafield(
+                                product_gid=product_gid,
+                                namespace="custom",
+                                key="designer",
+                                value=new_gid,
+                                metafield_type="metaobject_reference",
+                            )
+                            logger.info(
+                                "Designer %s recréé et lié à %s (nouveau GID : %s)",
+                                wee_designer_id, product_gid, new_gid,
+                            )
+                            done_links.add(link_key)
+                            _append_link_state(link_key, "ok", link_state_path)
+                            report.add(
+                                wee_designer_id=wee_designer_id,
+                                wee_product_id=wee_product_id,
+                                shopify_product_gid=product_gid,
+                                shopify_metaobject_gid=new_gid,
+                                action_metafield="created",
+                                statut="ok",
+                                message="recréé inline (GID obsolète)",
+                            )
+                            continue
+                    except ShopifyGraphQLError as retry_err:
+                        logger.error("Recréation inline échouée pour designer %s : %s", wee_designer_id, retry_err)
+
+                report.add(
+                    wee_designer_id=wee_designer_id,
+                    wee_product_id=wee_product_id,
+                    shopify_product_gid=product_gid,
+                    action_metafield="error",
+                    statut="error",
+                    message=err_msg,
+                )
             else:
                 logger.error(
                     "Erreur metafield produit %s <-> designer %s : %s",
                     wee_product_id, wee_designer_id, e,
                 )
-            report.add(
-                wee_designer_id=wee_designer_id,
-                wee_product_id=wee_product_id,
-                shopify_product_gid=product_gid,
-                action_metafield="error",
-                statut="error",
-                message=err_msg,
-            )
+                report.add(
+                    wee_designer_id=wee_designer_id,
+                    wee_product_id=wee_product_id,
+                    shopify_product_gid=product_gid,
+                    action_metafield="error",
+                    statut="error",
+                    message=err_msg,
+                )
 
     if stale_designers and import_state is not None and state_path is not None:
         logger.warning(
@@ -991,11 +1051,11 @@ def main() -> None:
 
     # Phase 1 — Metaobjects
     logger.info("--- Phase 1 : Import des metaobjects Designer ---")
-    id_to_gid, import_state, state_path = import_designers(designers, links, client, report, test_product_id)
+    id_to_gid, import_state, state_path, designers_by_id = import_designers(designers, links, client, report, test_product_id)
 
     # Phase 2 — Metafields produit
     logger.info("--- Phase 2 : Liaison produits <-> Designer ---")
-    link_products(links, id_to_gid, client, report, test_product_id, import_state, state_path)
+    link_products(links, id_to_gid, client, report, test_product_id, import_state, state_path, designers_by_id)
 
     # Rapport final
     report.save()
