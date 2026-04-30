@@ -72,28 +72,42 @@ def read_csv(path: Path) -> list[dict]:
 
 # ── Mapping produit Wee → Shopify ─────────────────────────────────────────────
 
-def resolve_shopify_product_gid(client: ShopifyClient, wee_product_id: str) -> str | None:
+def _load_product_mapping(path: Path) -> dict[str, str]:
+    """Charge output/product_mapping.csv → {wee_product_id: shopify_gid}."""
+    if not path.exists():
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        return {
+            row["wee_product_id"]: row["shopify_product_gid"]
+            for row in csv.DictReader(f)
+            if row.get("shopify_product_gid")
+        }
+
+
+def resolve_shopify_product_gid(
+    client: ShopifyClient,
+    wee_product_id: str,
+    product_mapping: dict[str, str],
+) -> str | None:
     """
     Trouve le GID Shopify d'un produit à partir de son ID Wee.
 
-    En mode test : utilise TEST_PRODUCT_SKU ou TEST_PRODUCT_HANDLE, UNIQUEMENT
-    si wee_product_id correspond à TEST_PRODUCT_ID. Pour tout autre produit → None.
-
-    Pour l'import global complet, un CSV de mapping wee_product_id ↔ shopify_gid
-    sera nécessaire (non implémenté — voir CLAUDE.md).
+    Ordre de résolution :
+      1. product_mapping.csv (construit par build_product_mapping.py)
+      2. TEST_PRODUCT_SKU / TEST_PRODUCT_HANDLE (produit de test uniquement)
     """
-    # SKU/handle de test : n'est valide que pour le produit de test explicitement défini
+    # 1. Mapping global (product_mapping.csv)
+    gid = product_mapping.get(str(wee_product_id))
+    if gid:
+        return gid
+
+    # 2. Produit de test (SKU/handle) — uniquement pour TEST_PRODUCT_ID
     if config.TEST_PRODUCT_ID and str(wee_product_id) == str(config.TEST_PRODUCT_ID):
         if config.TEST_PRODUCT_SKU:
             return client.find_product_by_sku(config.TEST_PRODUCT_SKU)
         if config.TEST_PRODUCT_HANDLE:
             return client.find_product_by_handle(config.TEST_PRODUCT_HANDLE)
 
-    # Pour tous les autres produits : pas de mapping disponible
-    logger.debug(
-        "Pas de mapping Shopify pour wee_product_id=%s (hors produit de test).",
-        wee_product_id,
-    )
     return None
 
 
@@ -594,6 +608,18 @@ def link_products(
         links = [l for l in links if str(l["product_id"]) == test_product_id]
         logger.info("Mode test : %d lien(s) à traiter", len(links))
 
+    # Chargement du mapping wee_product_id → shopify_gid
+    mapping_path = config.OUTPUT_DIR / "product_mapping.csv"
+    product_mapping = _load_product_mapping(mapping_path)
+    if product_mapping:
+        logger.info("Product mapping chargé : %d produit(s) mappés", len(product_mapping))
+    else:
+        logger.warning(
+            "product_mapping.csv absent ou vide — seul le produit de test sera lié.\n"
+            "  Pour lier tous les produits : python build_product_mapping.py --from-shopify\n"
+            "                             ou python build_product_mapping.py --from-db-handle"
+        )
+
     # Cache de reprise pour les liens déjà traités
     link_state_path = config.OUTPUT_DIR / "link_state.csv"
     done_links = _load_link_state(link_state_path)
@@ -630,7 +656,7 @@ def link_products(
             continue
 
         # Résolution du GID Shopify du produit
-        product_gid = resolve_shopify_product_gid(client, wee_product_id)
+        product_gid = resolve_shopify_product_gid(client, wee_product_id, product_mapping)
         if not product_gid:
             missing_links += 1
             logger.debug(

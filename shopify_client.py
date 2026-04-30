@@ -487,3 +487,112 @@ class ShopifyClient:
         if user_errors:
             raise ShopifyGraphQLError(f"userErrors metafield : {user_errors}")
         logger.info("Metafield %s.%s mis à jour sur %s", namespace, key, product_gid)
+
+    # ── Suppression metaobject ────────────────────────────────────────────────
+
+    def delete_metaobject(self, gid: str) -> bool:
+        """Supprime un metaobject par GID. Retourne True si supprimé."""
+        query = """
+        mutation DeleteMetaobject($id: ID!) {
+          metaobjectDelete(id: $id) {
+            deletedId
+            userErrors { field message }
+          }
+        }
+        """
+        data = self._run_mutation(query, {"id": gid})
+        if not data:
+            return False  # dry-run
+        result = data.get("metaobjectDelete", {})
+        user_errors = result.get("userErrors", [])
+        if user_errors:
+            raise ShopifyGraphQLError(f"userErrors metaobjectDelete : {user_errors}")
+        return bool(result.get("deletedId"))
+
+    def list_all_designer_metaobjects(self) -> list[str]:
+        """Retourne les GIDs de tous les metaobjects de type 'designer' (paginé)."""
+        query = """
+        query ListDesigners($after: String) {
+          metaobjects(type: "designer", first: 250, after: $after) {
+            edges { node { id } }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+        """
+        gids: list[str] = []
+        cursor = None
+        while True:
+            data = self._run(query, {"after": cursor})
+            result = data.get("metaobjects", {})
+            gids.extend(e["node"]["id"] for e in result.get("edges", []))
+            page_info = result.get("pageInfo", {})
+            if not page_info.get("hasNextPage"):
+                break
+            cursor = page_info["endCursor"]
+        return gids
+
+    # ── Listing produits (pour build_product_mapping) ─────────────────────────
+
+    def list_all_products_with_wee_id(self) -> dict[str, str]:
+        """
+        Retourne {wee_product_id: shopify_gid} pour tous les produits ayant
+        le metafield custom.wee_product_id renseigné.
+        """
+        query = """
+        query GetProductsWeeId($after: String) {
+          products(first: 250, after: $after) {
+            edges {
+              node {
+                id
+                metafield(namespace: "custom", key: "wee_product_id") { value }
+              }
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+        """
+        mapping: dict[str, str] = {}
+        cursor = None
+        page = 0
+        while True:
+            page += 1
+            data = self._run(query, {"after": cursor})
+            result = data.get("products", {})
+            for edge in result.get("edges", []):
+                node = edge["node"]
+                mf = node.get("metafield")
+                if mf and mf.get("value"):
+                    mapping[mf["value"]] = node["id"]
+            page_info = result.get("pageInfo", {})
+            logger.debug("Page %d : %d entrée(s) avec wee_product_id", page, len(mapping))
+            if not page_info.get("hasNextPage"):
+                break
+            cursor = page_info["endCursor"]
+        return mapping
+
+    def list_all_products_by_handle(self) -> dict[str, str]:
+        """Retourne {handle: shopify_gid} pour tous les produits Shopify (paginé)."""
+        query = """
+        query GetProductHandles($after: String) {
+          products(first: 250, after: $after) {
+            edges { node { id handle } }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+        """
+        mapping: dict[str, str] = {}
+        cursor = None
+        page = 0
+        while True:
+            page += 1
+            data = self._run(query, {"after": cursor})
+            result = data.get("products", {})
+            for edge in result.get("edges", []):
+                node = edge["node"]
+                mapping[node["handle"]] = node["id"]
+            page_info = result.get("pageInfo", {})
+            logger.debug("Page %d : %d produit(s) chargés au total", page, len(mapping))
+            if not page_info.get("hasNextPage"):
+                break
+            cursor = page_info["endCursor"]
+        return mapping
