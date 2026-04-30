@@ -497,74 +497,72 @@ def run_diagnose(client: ShopifyClient, links_path: Path) -> None:
                     parts.append(f"{c}='{r.get(c, '')}'")
                 logger.info("  %s", "  ".join(parts))
 
-    # ── Découverte des tables produit candidates dans la DB ──
-    logger.info("-" * 60)
-    logger.info("TABLES DB CANDIDATES (contenant 'product' ou 'variant' ou 'declination') :")
-    all_tables = fetch_all(
-        conn,
-        """
-        SELECT TABLE_NAME, TABLE_ROWS
-        FROM information_schema.TABLES
-        WHERE TABLE_SCHEMA = ?
-          AND TABLE_TYPE = 'BASE TABLE'
-          AND (TABLE_NAME LIKE '%product%' OR TABLE_NAME LIKE '%variant%'
-               OR TABLE_NAME LIKE '%declination%' OR TABLE_NAME LIKE '%declinaison%')
-        ORDER BY TABLE_ROWS DESC
-        LIMIT 20
-        """,
-        (config.DB_NAME,),
-    )
-    for t in all_tables:
-        logger.info("  %-45s  ~%s lignes", t["TABLE_NAME"], t["TABLE_ROWS"])
+        # ── Découverte des tables produit candidates dans la DB ──
+        logger.info("-" * 60)
+        logger.info("TABLES DB CANDIDATES (contenant 'product' ou 'variant' ou 'declination') :")
+        all_tables = fetch_all(
+            conn,
+            """
+            SELECT TABLE_NAME, TABLE_ROWS
+            FROM information_schema.TABLES
+            WHERE TABLE_SCHEMA = ?
+              AND TABLE_TYPE = 'BASE TABLE'
+              AND (TABLE_NAME LIKE '%product%' OR TABLE_NAME LIKE '%variant%'
+                   OR TABLE_NAME LIKE '%declination%' OR TABLE_NAME LIKE '%declinaison%')
+            ORDER BY TABLE_ROWS DESC
+            LIMIT 20
+            """,
+            (config.DB_NAME,),
+        )
+        for t in all_tables:
+            logger.info("  %-45s  ~%s lignes", t["TABLE_NAME"], t["TABLE_ROWS"])
 
-    # Colonnes des tables candidates (cherche reference, sku, ean, barcode)
-    logger.info("-" * 60)
-    logger.info("COLONNES SKU/RÉFÉRENCE DANS LES TABLES PRODUIT :")
-    sku_cols = fetch_all(
-        conn,
-        """
-        SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE
-        FROM information_schema.COLUMNS
-        WHERE TABLE_SCHEMA = ?
-          AND (TABLE_NAME LIKE '%product%' OR TABLE_NAME LIKE '%variant%'
-               OR TABLE_NAME LIKE '%declination%')
-          AND COLUMN_NAME IN ('reference','sku','ean','barcode','code','ref',
-                              'product_reference','ref_product','id_product')
-        ORDER BY TABLE_NAME, COLUMN_NAME
-        """,
-        (config.DB_NAME,),
-    )
-    if sku_cols:
-        for r in sku_cols:
-            logger.info("  %s.%s  (%s)", r["TABLE_NAME"], r["COLUMN_NAME"], r["DATA_TYPE"])
-        # Montre des valeurs d'exemple pour la première table/colonne trouvée
-        first = sku_cols[0]
-        sample_wee_id = all_wee_ids[0] if all_wee_ids else None
-        if sample_wee_id:
-            # Cherche un join possible entre cette table et product_id
-            table_cols_check = fetch_all(
-                conn,
-                "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
-                "WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
-                (config.DB_NAME, first["TABLE_NAME"]),
-            )
-            table_col_names = {r["COLUMN_NAME"] for r in table_cols_check}
-            id_col_candidate = next(
-                (c for c in ("product_id", "id_product", "id") if c in table_col_names), None
-            )
-            if id_col_candidate:
-                sample_rows = fetch_all(
+        # Colonnes des tables candidates (cherche reference, sku, ean, barcode)
+        logger.info("-" * 60)
+        logger.info("COLONNES SKU/RÉFÉRENCE DANS LES TABLES PRODUIT :")
+        sku_cols = fetch_all(
+            conn,
+            """
+            SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = ?
+              AND (TABLE_NAME LIKE '%product%' OR TABLE_NAME LIKE '%variant%'
+                   OR TABLE_NAME LIKE '%declination%')
+              AND COLUMN_NAME IN ('reference','sku','ean','barcode','code','ref',
+                                  'product_reference','ref_product','id_product')
+            ORDER BY TABLE_NAME, COLUMN_NAME
+            """,
+            (config.DB_NAME,),
+        )
+        if sku_cols:
+            for r in sku_cols:
+                logger.info("  %s.%s  (%s)", r["TABLE_NAME"], r["COLUMN_NAME"], r["DATA_TYPE"])
+            # Montre des valeurs d'exemple pour la première table/colonne trouvée
+            first = sku_cols[0]
+            if all_wee_ids:
+                table_cols_check = fetch_all(
                     conn,
-                    f"SELECT {id_col_candidate} AS pid, {first['COLUMN_NAME']} AS ref "
-                    f"FROM {first['TABLE_NAME']} "
-                    f"WHERE {id_col_candidate} IN ({','.join(['?']*min(5, len(all_wee_ids)))}) LIMIT 10",
-                    tuple(all_wee_ids[:5]),
+                    "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+                    "WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+                    (config.DB_NAME, first["TABLE_NAME"]),
                 )
-                logger.info("  Exemples valeurs %s.%s :", first["TABLE_NAME"], first["COLUMN_NAME"])
-                for r in sample_rows:
-                    logger.info("    pid=%-8s  ref='%s'", r["pid"], r["ref"])
-    else:
-        logger.warning("  Aucune colonne reference/sku/ean trouvée dans les tables produit.")
+                table_col_names = {r["COLUMN_NAME"] for r in table_cols_check}
+                id_col_candidate = next(
+                    (c for c in ("product_id", "id_product", "id") if c in table_col_names), None
+                )
+                if id_col_candidate:
+                    sample_rows = fetch_all(
+                        conn,
+                        f"SELECT {id_col_candidate} AS pid, {first['COLUMN_NAME']} AS ref "
+                        f"FROM {first['TABLE_NAME']} "
+                        f"WHERE {id_col_candidate} IN ({','.join(['?']*min(5, len(all_wee_ids)))}) LIMIT 10",
+                        tuple(all_wee_ids[:5]),
+                    )
+                    logger.info("  Exemples valeurs %s.%s :", first["TABLE_NAME"], first["COLUMN_NAME"])
+                    for r in sample_rows:
+                        logger.info("    pid=%-8s  ref='%s'", r["pid"], r["ref"])
+        else:
+            logger.warning("  Aucune colonne reference/sku/ean trouvée dans les tables produit.")
 
     # ── Shopify side ──
     logger.info("-" * 60)
