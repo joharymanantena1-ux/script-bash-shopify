@@ -570,6 +570,43 @@ class ShopifyClient:
             cursor = page_info["endCursor"]
         return mapping
 
+    def list_all_variants_by_sku(self) -> dict[str, str]:
+        """
+        Retourne {sku: shopify_product_gid} pour tous les variants Shopify (paginé).
+        Un produit peut avoir plusieurs variants/SKUs — on garde le premier trouvé.
+        """
+        query = """
+        query GetVariantSkus($after: String) {
+          productVariants(first: 250, after: $after) {
+            edges {
+              node {
+                sku
+                product { id }
+              }
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+        """
+        mapping: dict[str, str] = {}
+        cursor = None
+        page = 0
+        while True:
+            page += 1
+            data = self._run(query, {"after": cursor})
+            result = data.get("productVariants", {})
+            for edge in result.get("edges", []):
+                node = edge["node"]
+                sku = (node.get("sku") or "").strip()
+                if sku and sku not in mapping:
+                    mapping[sku] = node["product"]["id"]
+            page_info = result.get("pageInfo", {})
+            logger.debug("Page %d SKUs : %d entrée(s) chargées", page, len(mapping))
+            if not page_info.get("hasNextPage"):
+                break
+            cursor = page_info["endCursor"]
+        return mapping
+
     def list_all_products_by_handle(self) -> dict[str, str]:
         """Retourne {handle: shopify_gid} pour tous les produits Shopify (paginé)."""
         query = """

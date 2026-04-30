@@ -211,6 +211,92 @@ def fetch_slugs_from_db(conn, info: dict, product_ids: list[str]) -> dict[str, s
     return slug_by_id
 
 
+# ── Stratégie C : depuis la DB Wee (SKU / account_id_for_unicity) ────────────
+
+def build_from_db_sku(client: ShopifyClient, links_path: Path) -> dict[str, str]:
+    """
+    1. Lit account_id_for_unicity depuis product_trans (trans_id=DEFAULT_TRANS_ID)
+    2. Charge tous les SKUs Shopify (paginé, une seule passe)
+    3. Joint par SKU pour construire le mapping
+    """
+    from db import get_connection, fetch_all
+
+    if not links_path.exists():
+        logger.error("Fichier introuvable : %s — lancez export_designers_to_csv.py", links_path)
+        sys.exit(1)
+
+    with open(links_path, "r", encoding="utf-8") as f:
+        all_wee_ids = sorted({row["product_id"] for row in csv.DictReader(f) if row.get("product_id")})
+    logger.info("Wee product_id distincts dans les liens : %d", len(all_wee_ids))
+
+    with get_connection() as conn:
+        info = detect_product_table(conn)
+        if not info or "account_id_for_unicity" not in info.get("all_cols", set()):
+            logger.error(
+                "Colonne 'account_id_for_unicity' introuvable dans la table produit.\n"
+                "Essayez --from-db-handle ou --diagnose."
+            )
+            sys.exit(1)
+
+        logger.info("Lecture account_id_for_unicity depuis %s (trans_id=%s)...",
+                    info["table"], config.DEFAULT_TRANS_ID)
+
+        sku_by_id: dict[str, str] = {}
+        batch_size = 500
+        for i in range(0, len(all_wee_ids), batch_size):
+            batch = all_wee_ids[i: i + batch_size]
+            placeholders = ",".join("?" * len(batch))
+            if info["has_locale"] and "trans_id" in info["all_cols"]:
+                sql = (
+                    f"SELECT {info['id_col']} AS pid, account_id_for_unicity AS sku "
+                    f"FROM {info['table']} "
+                    f"WHERE {info['id_col']} IN ({placeholders}) AND trans_id = ?"
+                )
+                params = tuple(batch) + (config.DEFAULT_TRANS_ID,)
+            else:
+                sql = (
+                    f"SELECT {info['id_col']} AS pid, account_id_for_unicity AS sku "
+                    f"FROM {info['table']} "
+                    f"WHERE {info['id_col']} IN ({placeholders})"
+                )
+                params = tuple(batch)
+            rows = fetch_all(conn, sql, params)
+            for r in rows:
+                pid = str(r["pid"])
+                sku = str(r["sku"] or "").strip()
+                if sku and pid not in sku_by_id:
+                    sku_by_id[pid] = sku
+
+    logger.info("SKUs trouvés dans la DB : %d / %d", len(sku_by_id), len(all_wee_ids))
+    if not sku_by_id:
+        logger.error("Aucun SKU trouvé. Vérifiez account_id_for_unicity ou essayez --diagnose.")
+        sys.exit(1)
+
+    logger.info("Chargement de tous les SKUs Shopify (paginé, ~3-4 min)...")
+    shopify_skus = client.list_all_variants_by_sku()
+    logger.info("Variants Shopify chargés : %d SKU(s)", len(shopify_skus))
+
+    mapping: dict[str, str] = {}
+    for wee_id, sku in sku_by_id.items():
+        gid = shopify_skus.get(sku)
+        if gid:
+            mapping[wee_id] = gid
+
+    matched = len(mapping)
+    logger.info(
+        "Correspondances trouvées : %d / %d wee_product_id(s) (%.1f%%)",
+        matched, len(all_wee_ids),
+        100 * matched / len(all_wee_ids) if all_wee_ids else 0,
+    )
+
+    unmatched_with_sku = [wid for wid in sku_by_id if wid not in mapping]
+    if unmatched_with_sku:
+        logger.warning("%d produit(s) ont un SKU en DB mais aucune correspondance Shopify.", len(unmatched_with_sku))
+        logger.warning("  Exemples : %s", [(wid, sku_by_id[wid]) for wid in unmatched_with_sku[:5]])
+
+    return mapping
+
+
 # ── Stratégie A : depuis les metafields Shopify ───────────────────────────────
 
 def build_from_shopify(client: ShopifyClient, links_path: Path) -> dict[str, str]:
@@ -393,28 +479,59 @@ def run_diagnose(client: ShopifyClient, links_path: Path) -> None:
             for t in trans_ids:
                 logger.info("  trans_id=%-4s  %d lignes", t["trans_id"], t["cnt"])
 
+        # Exemples account_id_for_unicity et alias (potentiels SKUs)
+        if "account_id_for_unicity" in info["all_cols"] or "alias" in info["all_cols"]:
+            extra_cols = [c for c in ("account_id_for_unicity", "alias") if c in info["all_cols"]]
+            extra_select = ", ".join(f"{c} AS {c}" for c in extra_cols)
+            rows_sku = fetch_all(
+                conn,
+                f"SELECT {info['id_col']} AS pid, {extra_select} FROM {info['table']} "
+                f"WHERE {info['id_col']} IN ({placeholders}) AND trans_id = ? LIMIT 20",
+                tuple(sample_ids) + (config.DEFAULT_TRANS_ID,),
+            )
+            logger.info("-" * 60)
+            logger.info("AUTRES IDENTIFIANTS DB (account_id_for_unicity / alias) — potentiels SKUs :")
+            for r in rows_sku[:15]:
+                parts = [f"pid={r['pid']}"]
+                for c in extra_cols:
+                    parts.append(f"{c}='{r.get(c, '')}'")
+                logger.info("  %s", "  ".join(parts))
+
     # ── Shopify side ──
     logger.info("-" * 60)
-    logger.info("Chargement de 250 handles Shopify (première page)...")
-    gql = """
+    logger.info("HANDLES SHOPIFY (20 premiers produits créés) :")
+    gql_handles = """
     query {
       products(first: 20, sortKey: CREATED_AT) {
         edges { node { id handle } }
       }
     }
     """
-    data = client._run(gql)
-    edges = data.get("products", {}).get("edges", [])
-    logger.info("HANDLES SHOPIFY (20 premiers produits créés) :")
-    for e in edges:
+    data = client._run(gql_handles)
+    for e in data.get("products", {}).get("edges", []):
         h = e["node"]["handle"]
-        logger.info("  handle='%s'  normalized='%s'", h, normalize_handle(h))
+        logger.info("  handle='%s'", h)
+
+    logger.info("-" * 60)
+    logger.info("SKUs SHOPIFY (20 premiers variants) :")
+    gql_skus = """
+    query {
+      productVariants(first: 20) {
+        edges { node { sku product { id handle } } }
+      }
+    }
+    """
+    data = client._run(gql_skus)
+    for e in data.get("productVariants", {}).get("edges", []):
+        n = e["node"]
+        logger.info("  sku='%s'  product_handle='%s'", n.get("sku", ""), n["product"]["handle"])
 
     logger.info("=" * 60)
     logger.info("INTERPRÉTATION :")
-    logger.info("  Si les slugs DB ressemblent aux handles Shopify → --from-db-handle fonctionnera.")
-    logger.info("  Si les formats sont complètement différents → mapping manuel ou autre stratégie.")
-    logger.info("  Vérifiez le bon trans_id ci-dessus (DEFAULT_TRANS_ID=%s dans .env).", config.DEFAULT_TRANS_ID)
+    logger.info("  1. Si slugs DB ≈ handles Shopify      → --from-db-handle")
+    logger.info("  2. Si account_id_for_unicity ≈ SKUs Shopify → --from-db-sku")
+    logger.info("  3. Si rien ne correspond               → mapping manuel nécessaire")
+    logger.info("  DEFAULT_TRANS_ID=%s dans .env (trans_id=1 = FR avec 136534 lignes)", config.DEFAULT_TRANS_ID)
 
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
@@ -435,6 +552,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         dest="from_db",
         help="Lit les slugs dans la DB Wee et les associe aux handles Shopify",
+    )
+    mode.add_argument(
+        "--from-db-sku",
+        action="store_true",
+        dest="from_db_sku",
+        help="Lit account_id_for_unicity dans la DB Wee et le croise avec les SKUs Shopify",
     )
     mode.add_argument(
         "--diagnose",
@@ -471,6 +594,9 @@ def main() -> None:
     if args.from_shopify:
         mapping = build_from_shopify(client, links_path)
         source_label = "shopify_metafield"
+    elif args.from_db_sku:
+        mapping = build_from_db_sku(client, links_path)
+        source_label = "db_sku"
     else:
         mapping = build_from_db_handle(client, links_path)
         source_label = "db_handle"
