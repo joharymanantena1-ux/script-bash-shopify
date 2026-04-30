@@ -581,7 +581,7 @@ class ShopifyClient:
         query GetMetaobjectDef($type: String!) {
           metaobjectDefinitionByType(type: $type) {
             id
-            displayNameField
+            displayNameKey
           }
         }
         """
@@ -592,15 +592,15 @@ class ShopifyClient:
             return False
 
         def_id = defn["id"]
-        current = defn.get("displayNameField")
-        logger.info("Définition '%s' : displayNameField actuel = '%s'", type_name, current)
+        current = defn.get("displayNameKey")
+        logger.info("Définition '%s' : displayNameKey actuel = '%s'", type_name, current)
 
         if current == field_key:
-            logger.info("displayNameField déjà configuré sur '%s'. Rien à faire.", field_key)
+            logger.info("displayNameKey déjà configuré sur '%s'. Rien à faire.", field_key)
             return True
 
         if self.dry_run:
-            logger.info("[DRY-RUN] metaobjectDefinitionUpdate ignoré (displayNameField → '%s').", field_key)
+            logger.info("[DRY-RUN] metaobjectDefinitionUpdate ignoré (displayNameKey → '%s').", field_key)
             return True
 
         # 2. Met à jour
@@ -609,7 +609,7 @@ class ShopifyClient:
           metaobjectDefinitionUpdate(id: $id, definition: $definition) {
             metaobjectDefinition {
               id
-              displayNameField
+              displayNameKey
             }
             userErrors { field message }
           }
@@ -625,7 +625,7 @@ class ShopifyClient:
             logger.error("Erreur metaobjectDefinitionUpdate : %s", errors)
             return False
 
-        new_field = (update.get("metaobjectDefinition") or {}).get("displayNameField")
+        new_field = (update.get("metaobjectDefinition") or {}).get("displayNameKey")
         logger.info("displayNameField mis à jour : '%s' → '%s'", current, new_field)
         return True
 
