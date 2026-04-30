@@ -253,6 +253,14 @@ def _append_designer_state(entry: dict, path: Path) -> None:
         writer.writerow(entry)
 
 
+def _rewrite_import_state(state: dict, path: Path) -> None:
+    """Réécrit import_state.csv depuis le dict en mémoire (utilisé pour purger les GIDs obsolètes)."""
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=_STATE_COLUMNS)
+        writer.writeheader()
+        writer.writerows(state.values())
+
+
 # ── State cache Phase 2 (liens produit) ──────────────────────────────────────
 
 _LINK_STATE_COLUMNS = ["product_id", "wee_designer_id", "status", "processed_at"]
@@ -591,7 +599,7 @@ def import_designers(
     if image_gid_cache:
         _save_image_gid_map(image_gid_cache, image_sources, gid_map_path)
 
-    return id_to_gid
+    return id_to_gid, import_state, state_path
 
 
 def link_products(
@@ -600,6 +608,8 @@ def link_products(
     client: ShopifyClient,
     report: ImportReport,
     test_product_id: str | None,
+    import_state: dict | None = None,
+    state_path: Path | None = None,
 ) -> None:
     """
     Phase 2 : lie chaque produit Shopify à son metaobject designer via metafield.
@@ -628,6 +638,7 @@ def link_products(
 
     skipped_links = 0
     missing_links = 0
+    stale_designers: set[str] = set()
 
     for link in links:
         wee_product_id = str(link["product_id"])
@@ -696,18 +707,35 @@ def link_products(
             _append_link_state(link_key, "ok", link_state_path)
 
         except ShopifyGraphQLError as e:
-            logger.error(
-                "Erreur metafield produit %s <-> designer %s : %s",
-                wee_product_id, wee_designer_id, e,
-            )
+            err_msg = str(e)
+            if "Value must belong to the specified metaobject definition" in err_msg:
+                logger.warning(
+                    "GID obsolète pour designer %s (%s) — sera recréé au prochain run.",
+                    wee_designer_id, metaobject_gid,
+                )
+                stale_designers.add(wee_designer_id)
+                if import_state and wee_designer_id in import_state:
+                    del import_state[wee_designer_id]
+            else:
+                logger.error(
+                    "Erreur metafield produit %s <-> designer %s : %s",
+                    wee_product_id, wee_designer_id, e,
+                )
             report.add(
                 wee_designer_id=wee_designer_id,
                 wee_product_id=wee_product_id,
                 shopify_product_gid=product_gid,
                 action_metafield="error",
                 statut="error",
-                message=str(e),
+                message=err_msg,
             )
+
+    if stale_designers and import_state is not None and state_path is not None:
+        logger.warning(
+            "%d GID(s) obsolètes purgés du cache — relancez le script pour les recréer : %s",
+            len(stale_designers), sorted(stale_designers),
+        )
+        _rewrite_import_state(import_state, state_path)
 
     if skipped_links:
         logger.info("Phase 2 : %d lien(s) repris depuis le cache (aucun appel API).", skipped_links)
@@ -963,11 +991,11 @@ def main() -> None:
 
     # Phase 1 — Metaobjects
     logger.info("--- Phase 1 : Import des metaobjects Designer ---")
-    id_to_gid = import_designers(designers, links, client, report, test_product_id)
+    id_to_gid, import_state, state_path = import_designers(designers, links, client, report, test_product_id)
 
     # Phase 2 — Metafields produit
     logger.info("--- Phase 2 : Liaison produits <-> Designer ---")
-    link_products(links, id_to_gid, client, report, test_product_id)
+    link_products(links, id_to_gid, client, report, test_product_id, import_state, state_path)
 
     # Rapport final
     report.save()
