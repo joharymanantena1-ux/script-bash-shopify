@@ -239,6 +239,39 @@ def _save_designer_state(state: dict[str, dict], path: Path) -> None:
         writer.writerows(state.values())
 
 
+# ── State cache Phase 2 (liens produit) ──────────────────────────────────────
+
+_LINK_STATE_COLUMNS = ["product_id", "wee_designer_id", "status", "processed_at"]
+
+
+def _load_link_state(path: Path) -> set[tuple[str, str]]:
+    """Charge output/link_state.csv → ensemble de (product_id, wee_designer_id) déjà traités."""
+    if not path.exists():
+        return set()
+    with open(path, "r", encoding="utf-8") as f:
+        return {
+            (row["product_id"], row["wee_designer_id"])
+            for row in csv.DictReader(f)
+            if row.get("status") == "ok"
+        }
+
+
+def _append_link_state(key: tuple[str, str], status: str, path: Path) -> None:
+    """Ajoute une ligne dans link_state.csv (append, pas de réécriture complète)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not path.exists()
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=_LINK_STATE_COLUMNS)
+        if write_header:
+            writer.writeheader()
+        writer.writerow({
+            "product_id": key[0],
+            "wee_designer_id": key[1],
+            "status": status,
+            "processed_at": datetime.now().isoformat(timespec="seconds"),
+        })
+
+
 def _resolve_image_gid(
     row: dict,
     client: ShopifyClient,
@@ -462,6 +495,23 @@ def import_designers(
             drive_folder_id=drive_folder_id,
         )
         fields = designer_row_to_fields(row, image_gid=image_gid)
+
+        # Shopify exige que 'name' soit non vide
+        if not fields.get("name", "").strip():
+            logger.warning(
+                "Designer %s ignore : champ 'name' vide dans le CSV (langue=%s). "
+                "Verifiez la donnee dans MariaDB.",
+                wee_id, langue,
+            )
+            report.add(
+                wee_designer_id=wee_id,
+                langue=langue,
+                action_metaobject="skipped",
+                statut="skipped",
+                message="name vide — metaobject non cree",
+            )
+            continue
+
         action = "skipped"
         gid = None
 
@@ -538,10 +588,25 @@ def link_products(
         links = [l for l in links if str(l["product_id"]) == test_product_id]
         logger.info("Mode test : %d lien(s) à traiter", len(links))
 
+    # Cache de reprise pour les liens déjà traités
+    link_state_path = config.OUTPUT_DIR / "link_state.csv"
+    done_links = _load_link_state(link_state_path)
+    if done_links:
+        logger.info("Link state charge : %d lien(s) deja traites", len(done_links))
+
     for link in links:
         wee_product_id = str(link["product_id"])
         wee_designer_id = str(link["wee_designer_id"])
         designer_nom = link.get("designer_nom", "")
+        link_key = (wee_product_id, wee_designer_id)
+
+        # Reprise : skip si lien déjà traité avec succès
+        if link_key in done_links:
+            logger.debug(
+                "Lien produit=%s designer=%s deja traite (cache) — ignore.",
+                wee_product_id, wee_designer_id,
+            )
+            continue
 
         metaobject_gid = id_to_gid.get(wee_designer_id)
         if not metaobject_gid:
@@ -594,6 +659,8 @@ def link_products(
                 action_metafield=action,
                 statut="ok",
             )
+            done_links.add(link_key)
+            _append_link_state(link_key, "ok", link_state_path)
 
         except ShopifyGraphQLError as e:
             logger.error(
@@ -780,7 +847,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         dest="reset_cache",
         default=False,
-        help="Supprime import_state.csv et image_gid_map.csv puis quitte",
+        help="Supprime import_state.csv, link_state.csv et image_gid_map.csv puis quitte",
     )
 
     return parser.parse_args()
@@ -797,6 +864,7 @@ def main() -> None:
         files_to_delete = [
             output_dir / "import_state.csv",
             output_dir / "image_gid_map.csv",
+            output_dir / "link_state.csv",
         ]
         for f in files_to_delete:
             if f.exists():

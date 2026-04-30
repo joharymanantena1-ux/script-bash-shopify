@@ -8,6 +8,7 @@ Chaque étape doit réussir avant de passer à la suivante.
 ## Prérequis
 
 Remplir le fichier `.env` (copier depuis `.env.example`) avec :
+
 - `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`
 - `SHOPIFY_STORE`, `SHOPIFY_ACCESS_TOKEN`
 - `TEST_PRODUCT_ID` (ID Wee du produit de test)
@@ -68,6 +69,7 @@ python import_designers_to_shopify.py --test --preview
 ```
 
 > Génère `output/import_preview.csv` et affiche dans la console :
+>
 > - Nombre de designers à créer / déjà en cache
 > - Statut des images (cache ou à uploader)
 > - Liens produit mappables ou manquants
@@ -97,6 +99,7 @@ python import_designers_to_shopify.py --test --no-dry-run
 ```
 
 > Résultat attendu dans les logs :
+>
 > - `action_metaobject = created`
 > - `action_metafield = created`
 > - `statut = ok`
@@ -112,6 +115,7 @@ python verify_shopify.py
 ```
 
 > Vérifie pour le produit de test :
+>
 > - Définition du type `designer` (champs et types)
 > - Metaobject : statut ACTIVE, image présente, locale `fr-FR`, baseline
 > - Metafield produit `custom.designer` lié au bon GID
@@ -174,7 +178,7 @@ python import_designers_to_shopify.py --global-import --dry-run
 python import_designers_to_shopify.py --global-import --no-dry-run
 ```
 
-> L'import reprend automatiquement là où il s'est arrêté si interrompu (`import_state.csv`).
+> L'import reprend automatiquement là où il s'est arrêté si interrompu (`import_state.csv` pour Phase 1, `link_state.csv` pour Phase 2).
 
 ---
 
@@ -202,12 +206,13 @@ python verify_shopify.py
 ## Résumé des fichiers générés
 
 | Fichier | Contenu |
-|---|---|
+| --- | --- |
 | `output/designers.csv` | Données designers exportées depuis MariaDB |
 | `output/product_designer_links.csv` | Liaisons produit ↔ designer |
 | `output/import_report.csv` | Rapport de chaque run d'import |
 | `output/import_preview.csv` | Aperçu généré par `--preview` |
-| `output/import_state.csv` | Cache d'état (reprise après interruption) |
+| `output/import_state.csv` | Cache Phase 1 — metaobjects (reprise après interruption) |
+| `output/link_state.csv` | Cache Phase 2 — liens produit (reprise après interruption) |
 | `output/image_gid_map.csv` | Cache des GID Shopify des images |
 | `logs/import_*.log` | Logs horodatés de chaque import |
 | `logs/export_*.log` | Logs horodatés de chaque export |
