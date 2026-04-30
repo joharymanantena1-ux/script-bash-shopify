@@ -75,25 +75,22 @@ def resolve_shopify_product_gid(client: ShopifyClient, wee_product_id: str) -> s
     """
     Trouve le GID Shopify d'un produit à partir de son ID Wee.
 
-    Ordre de recherche :
-      1. TEST_PRODUCT_SKU    (si renseigné dans .env)
-      2. TEST_PRODUCT_HANDLE (si renseigné dans .env)
-      3. Metafield custom.wee_product_id (non implémenté — voir CLAUDE.md)
+    En mode test : utilise TEST_PRODUCT_SKU ou TEST_PRODUCT_HANDLE, UNIQUEMENT
+    si wee_product_id correspond à TEST_PRODUCT_ID. Pour tout autre produit → None.
 
-    Pour l'import global, vous devrez maintenir un CSV de mapping
-    wee_product_id ↔ shopify_gid (voir section "Mapping" dans CLAUDE.md).
+    Pour l'import global complet, un CSV de mapping wee_product_id ↔ shopify_gid
+    sera nécessaire (non implémenté — voir CLAUDE.md).
     """
-    # En mode test, on utilise les critères du .env
-    if config.TEST_PRODUCT_SKU:
-        return client.find_product_by_sku(config.TEST_PRODUCT_SKU)
+    # SKU/handle de test : n'est valide que pour le produit de test explicitement défini
+    if config.TEST_PRODUCT_ID and str(wee_product_id) == str(config.TEST_PRODUCT_ID):
+        if config.TEST_PRODUCT_SKU:
+            return client.find_product_by_sku(config.TEST_PRODUCT_SKU)
+        if config.TEST_PRODUCT_HANDLE:
+            return client.find_product_by_handle(config.TEST_PRODUCT_HANDLE)
 
-    if config.TEST_PRODUCT_HANDLE:
-        return client.find_product_by_handle(config.TEST_PRODUCT_HANDLE)
-
-    # Fallback : recherche par wee_product_id (non implémenté)
-    logger.warning(
-        "Impossible de résoudre le produit Shopify pour wee_product_id=%s. "
-        "Renseignez TEST_PRODUCT_SKU ou TEST_PRODUCT_HANDLE dans .env.",
+    # Pour tous les autres produits : pas de mapping disponible
+    logger.debug(
+        "Pas de mapping Shopify pour wee_product_id=%s (hors produit de test).",
         wee_product_id,
     )
     return None
@@ -457,6 +454,7 @@ def import_designers(
 
     seen_ids: set[str] = set()
     id_to_gid: dict[str, str] = {}
+    skipped_from_cache = 0
 
     for row in designers:
         wee_id = str(row.get("wee_designer_id", ""))
@@ -472,9 +470,10 @@ def import_designers(
         if wee_id in import_state:
             cached_gid = import_state[wee_id].get("shopify_metaobject_gid", "")
             if cached_gid and not cached_gid.startswith("[DRY-RUN"):
-                logger.info(
+                logger.debug(
                     "Designer %s deja traite (cache) — GID : %s", wee_id, cached_gid[:50]
                 )
+                skipped_from_cache += 1
                 id_to_gid[wee_id] = cached_gid
                 report.add(
                     wee_designer_id=wee_id,
@@ -567,6 +566,9 @@ def import_designers(
             }
             _save_designer_state(import_state, state_path)
 
+    if skipped_from_cache:
+        logger.info("Phase 1 : %d designer(s) repris depuis le cache (aucun appel API).", skipped_from_cache)
+
     # Persister la carte GID images pour éviter re-uploads lors du prochain run
     if image_gid_cache:
         _save_image_gid_map(image_gid_cache, image_sources, gid_map_path)
@@ -592,7 +594,10 @@ def link_products(
     link_state_path = config.OUTPUT_DIR / "link_state.csv"
     done_links = _load_link_state(link_state_path)
     if done_links:
-        logger.info("Link state charge : %d lien(s) deja traites", len(done_links))
+        logger.info("Link state charge : %d lien(s) deja traites (ignores).", len(done_links))
+
+    skipped_links = 0
+    missing_links = 0
 
     for link in links:
         wee_product_id = str(link["product_id"])
@@ -602,10 +607,7 @@ def link_products(
 
         # Reprise : skip si lien déjà traité avec succès
         if link_key in done_links:
-            logger.debug(
-                "Lien produit=%s designer=%s deja traite (cache) — ignore.",
-                wee_product_id, wee_designer_id,
-            )
+            skipped_links += 1
             continue
 
         metaobject_gid = id_to_gid.get(wee_designer_id)
@@ -626,7 +628,8 @@ def link_products(
         # Résolution du GID Shopify du produit
         product_gid = resolve_shopify_product_gid(client, wee_product_id)
         if not product_gid:
-            logger.warning(
+            missing_links += 1
+            logger.debug(
                 "Produit Shopify introuvable pour wee_product_id=%s (designer : %s)",
                 wee_product_id, designer_nom,
             )
@@ -675,6 +678,13 @@ def link_products(
                 statut="error",
                 message=str(e),
             )
+
+    if skipped_links:
+        logger.info("Phase 2 : %d lien(s) repris depuis le cache (aucun appel API).", skipped_links)
+    if missing_links:
+        logger.info(
+            "Phase 2 : %d lien(s) sans mapping produit Wee -> Shopify (ignores).", missing_links
+        )
 
 
 # ── Aperçu (--preview) ───────────────────────────────────────────────────────
