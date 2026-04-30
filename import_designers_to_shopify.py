@@ -312,7 +312,7 @@ def _resolve_image_gid(
             except ShopifyGraphQLError as e:
                 logger.debug("  fileCreate URL échoué (%s) : %s", url_path[:30], e)
 
-    # 4. Google Drive → download + upload Shopify
+    # 4. Google Drive → vérification (dry-run) ou download + upload (réel)
     if drive_service is None:
         logger.warning(
             "Image id=%s absente de Shopify Files. Options disponibles :\n"
@@ -324,6 +324,26 @@ def _resolve_image_gid(
         return None
 
     logger.info("Recherche image id=%s dans Google Drive...", image_id)
+
+    # En dry-run : vérifier l'existence sans télécharger (beaucoup plus rapide)
+    if client.dry_run:
+        from google_drive import find_file
+        for drive_name in drive_search_names:
+            if find_file(drive_service, drive_name, drive_folder_id):
+                logger.info(
+                    "  [DRY-RUN] Image trouvee dans Drive : '%s' — upload simule.", drive_name
+                )
+                placeholder = f"[DRY-RUN-IMAGE-{image_id}]"
+                gid_map[cache_key] = placeholder
+                sources[cache_key] = "google_drive_dry_run"
+                return placeholder
+        logger.warning(
+            "Image id=%s introuvable dans Drive (cherche : %s). Champ image laisse vide.",
+            image_id, ", ".join(drive_search_names),
+        )
+        return None
+
+    # Mode réel : télécharger puis uploader vers Shopify Files
     from google_drive import download_file
     file_bytes = None
     for drive_name in drive_search_names:

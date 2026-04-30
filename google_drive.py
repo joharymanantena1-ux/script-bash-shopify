@@ -92,6 +92,29 @@ def find_folder_id(service, folder_name: str) -> str | None:
     return folders[0]["id"]
 
 
+def find_file(service, filename: str, folder_id: str | None) -> bool:
+    """
+    Vérifie l'existence d'un fichier dans Google Drive SANS le télécharger.
+    Utile en dry-run pour valider la présence d'une image rapidement.
+    """
+    query = f"name='{filename}' and trashed=false"
+    if folder_id:
+        query += f" and '{folder_id}' in parents"
+
+    result = service.files().list(
+        q=query,
+        fields="files(id, name)",
+        pageSize=1,
+        includeItemsFromAllDrives=True,
+        supportsAllDrives=True,
+    ).execute()
+    files = result.get("files", [])
+
+    if not files and folder_id:
+        return find_file(service, filename, folder_id=None)
+    return len(files) > 0
+
+
 def download_file(service, filename: str, folder_id: str | None) -> bytes | None:
     """
     Télécharge un fichier depuis Google Drive (My Drive + Shared Drives).
