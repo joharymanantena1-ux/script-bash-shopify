@@ -2,19 +2,12 @@
 audit_shopify.py — Audit complet de l'état de la migration Designer
 
 Compare les données source (CSV), l'état des caches locaux et l'état réel
-de Shopify pour produire un rapport exhaustif.
-
-Sections du rapport :
-  1. DONNÉES SOURCE         — ce que la DB Wee contient
-  2. ÉTAT SHOPIFY           — metaobjects et liaisons produits réels (API live)
-  3. ÉTAT CACHE LOCAL       — import_state.csv et link_state.csv
-  4. ANALYSE CROISÉE        — manquants, orphelins, taux de réussite
-  5. RECOMMANDATIONS        — prochaines étapes suggérées
+de Shopify pour produire un rapport exhaustif avec barres de progression.
 
 Usage :
-  python audit_shopify.py              # audit complet (lent ~5 min, appels API)
-  python audit_shopify.py --no-api     # audit cache + CSV uniquement (rapide)
-  python audit_shopify.py --json       # sortie JSON en plus du log
+  python audit_shopify.py              # audit complet (API live ~5 min)
+  python audit_shopify.py --no-api     # audit CSV/cache uniquement (rapide)
+  python audit_shopify.py --json       # + export output/audit_report.json
 """
 
 import argparse
@@ -22,6 +15,7 @@ import csv
 import json
 import logging
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -43,9 +37,42 @@ def setup_logging() -> None:
             logging.StreamHandler(sys.stdout),
         ],
     )
-    logging.info("Log audit : %s", log_file)
 
 logger = logging.getLogger(__name__)
+
+
+# ── Affichage ─────────────────────────────────────────────────────────────────
+
+BAR_WIDTH = 24
+
+def progress_bar(part: int, total: int, width: int = BAR_WIDTH) -> str:
+    """Retourne une barre ASCII + pourcentage + fraction."""
+    if not total:
+        return f"{'░' * width}  N/A"
+    ratio = min(part / total, 1.0)
+    filled = int(ratio * width)
+    bar = "█" * filled + "░" * (width - filled)
+    return f"{bar}  {ratio * 100:5.1f}%  ({part:,} / {total:,})"
+
+
+def progress_line(label: str, part: int, total: int) -> None:
+    logger.info("  %-32s %s", label, progress_bar(part, total))
+
+
+def header(title: str) -> None:
+    logger.info("")
+    logger.info("╔══════════════════════════════════════════════════════════════╗")
+    logger.info("║  %-60s║", title)
+    logger.info("╚══════════════════════════════════════════════════════════════╝")
+
+
+def section(title: str) -> None:
+    logger.info("")
+    logger.info("┌─ %s %s", title, "─" * max(0, 58 - len(title)))
+
+
+def divider() -> None:
+    logger.info("  %s", "─" * 60)
 
 
 # ── Chargement CSV ────────────────────────────────────────────────────────────
@@ -75,31 +102,20 @@ def load_link_state(path: Path) -> set[tuple[str, str]]:
         }
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def pct(part: int, total: int) -> str:
-    if not total:
-        return "N/A"
-    return f"{100 * part / total:.1f}%"
-
-
-def sep(title: str = "") -> None:
-    if title:
-        logger.info("=" * 60)
-        logger.info("  %s", title)
-        logger.info("=" * 60)
-    else:
-        logger.info("-" * 60)
+def pct_val(part: int, total: int) -> float:
+    return round(100 * part / total, 1) if total else 0.0
 
 
 # ── Audit ─────────────────────────────────────────────────────────────────────
 
 def run_audit(no_api: bool, output_json: bool) -> dict:
     output_dir = config.OUTPUT_DIR
-    report: dict = {}
+    report: dict = {"generated_at": datetime.now().isoformat()}
+
+    header("AUDIT MIGRATION DESIGNER  —  " + datetime.now().strftime("%Y-%m-%d %H:%M"))
 
     # ── 1. DONNÉES SOURCE ─────────────────────────────────────────────────────
-    sep("1. DONNÉES SOURCE (fichiers CSV)")
+    section("1. DONNÉES SOURCE")
 
     designers_rows = load_csv(output_dir / "designers.csv")
     links_rows     = load_csv(output_dir / "product_designer_links.csv")
@@ -109,128 +125,158 @@ def run_audit(no_api: bool, output_json: bool) -> dict:
     unique_designers_csv = {str(r["wee_designer_id"]) for r in designers_rows if r.get("wee_designer_id")}
     unique_products_csv  = {str(r["product_id"])      for r in links_rows     if r.get("product_id")}
     mapped_products      = {str(r["wee_product_id"])  for r in mapping_rows   if r.get("wee_product_id")}
-    cached_images        = {r["image_file"]           for r in image_map_rows if r.get("shopify_gid") and not r["shopify_gid"].startswith("[DRY")}
+    cached_images        = {
+        r["image_file"] for r in image_map_rows
+        if r.get("shopify_gid") and not r["shopify_gid"].startswith("[DRY")
+    }
 
-    total_links          = len(links_rows)
-    links_with_mapping   = sum(1 for r in links_rows if str(r.get("product_id", "")) in mapped_products)
+    total_links           = len(links_rows)
+    products_in_links     = len(unique_products_csv)
+    mapped_in_links       = len(mapped_products & unique_products_csv)
+    unmapped_in_links     = products_in_links - mapped_in_links
+    links_with_mapping    = sum(1 for r in links_rows if str(r.get("product_id", "")) in mapped_products)
     links_without_mapping = total_links - links_with_mapping
 
-    logger.info("Designers uniques dans designers.csv       : %d", len(unique_designers_csv))
-    logger.info("Lignes dans product_designer_links.csv     : %d", total_links)
-    logger.info("Produits Wee uniques dans les liens        : %d", len(unique_products_csv))
-    logger.info("Produits mappés dans product_mapping.csv   : %d", len(mapped_products))
-    logger.info("Produits SANS mapping (liens impossibles)  : %d (%s)", len(unique_products_csv) - len(mapped_products & unique_products_csv), pct(len(unique_products_csv) - len(mapped_products & unique_products_csv), len(unique_products_csv)))
-    logger.info("Liens avec mapping disponible              : %d (%s)", links_with_mapping, pct(links_with_mapping, total_links))
-    logger.info("Images dans image_gid_map.csv              : %d", len(cached_images))
+    logger.info("  Designers uniques (source)             : %d", len(unique_designers_csv))
+    logger.info("  Liens produit-designer (total)         : %d", total_links)
+    logger.info("  Produits Wee uniques dans les liens    : %d", products_in_links)
+    progress_line("Produits avec mapping Shopify", mapped_in_links, products_in_links)
+    progress_line("Liens avec mapping disponible", links_with_mapping, total_links)
+    logger.info("  Images dans image_gid_map.csv          : %d", len(cached_images))
 
     report["source"] = {
         "unique_designers": len(unique_designers_csv),
         "total_links": total_links,
-        "unique_products_in_links": len(unique_products_csv),
-        "mapped_products": len(mapped_products),
+        "unique_products_in_links": products_in_links,
+        "mapped_products": mapped_in_links,
+        "unmapped_products": unmapped_in_links,
         "links_with_mapping": links_with_mapping,
         "links_without_mapping": links_without_mapping,
         "cached_images": len(cached_images),
     }
 
-    # ── 2. ÉTAT CACHE LOCAL ───────────────────────────────────────────────────
-    sep("2. ÉTAT CACHE LOCAL")
+    # ── 2. CACHE LOCAL ────────────────────────────────────────────────────────
+    section("2. CACHE LOCAL")
 
     import_state = load_import_state(output_dir / "import_state.csv")
-    link_state   = load_link_state(output_dir / "link_state.csv")
+    link_state   = load_link_state(output_dir  / "link_state.csv")
 
-    cached_ok      = sum(1 for v in import_state.values() if v.get("shopify_metaobject_gid") and not v["shopify_metaobject_gid"].startswith("[DRY"))
-    cached_dry_run = sum(1 for v in import_state.values() if (v.get("shopify_metaobject_gid") or "").startswith("[DRY"))
-    cached_missing = len(unique_designers_csv) - len(import_state)
+    cached_real    = sum(1 for v in import_state.values()
+                         if v.get("shopify_metaobject_gid") and not v["shopify_metaobject_gid"].startswith("[DRY"))
+    cached_dryrun  = sum(1 for v in import_state.values()
+                         if (v.get("shopify_metaobject_gid") or "").startswith("[DRY"))
+    designers_not_cached = max(0, len(unique_designers_csv) - len(import_state))
 
-    logger.info("import_state.csv — entrées totales         : %d", len(import_state))
-    logger.info("  dont GID réels (non dry-run)             : %d", cached_ok)
-    logger.info("  dont dry-run (placeholder)               : %d", cached_dry_run)
-    logger.info("  designers absents du cache               : %d", max(0, cached_missing))
-    logger.info("link_state.csv  — liens OK en cache        : %d (%s)", len(link_state), pct(len(link_state), links_with_mapping))
+    progress_line("Designers dans import_state.csv", cached_real, len(unique_designers_csv))
+    logger.info("  ├ GID réels (non dry-run)              : %d", cached_real)
+    logger.info("  ├ Dry-run (placeholders)               : %d", cached_dryrun)
+    logger.info("  └ Absents du cache                     : %d", designers_not_cached)
+    divider()
+    progress_line("Liens dans link_state.csv", len(link_state), links_with_mapping)
 
     report["cache"] = {
         "import_state_total": len(import_state),
-        "import_state_real_gids": cached_ok,
-        "import_state_dry_run": cached_dry_run,
-        "designers_not_in_cache": max(0, cached_missing),
+        "import_state_real_gids": cached_real,
+        "import_state_dry_run": cached_dryrun,
+        "designers_not_in_cache": designers_not_cached,
         "link_state_ok": len(link_state),
+        "link_state_pct": pct_val(len(link_state), links_with_mapping),
     }
 
     # ── 3. ÉTAT SHOPIFY (API live) ────────────────────────────────────────────
+    shopify_metaobjects: list[dict] = []
+    linked_products: list[dict] = []
+
     if no_api:
-        sep("3. ÉTAT SHOPIFY (ignoré — --no-api)")
-        logger.info("Utilisez sans --no-api pour interroger Shopify.")
+        section("3. ÉTAT SHOPIFY  [ignoré — --no-api]")
+        logger.info("  Utilisez sans --no-api pour interroger Shopify en direct.")
         report["shopify"] = {"skipped": True}
     else:
-        sep("3. ÉTAT SHOPIFY (appels API — peut prendre 5-10 min)")
-
+        section("3. ÉTAT SHOPIFY  [appels API — ~5-10 min]")
         client = ShopifyClient(dry_run=False)
 
-        # Metaobjects
-        logger.info("Chargement des metaobjects designer depuis Shopify...")
-        try:
-            shopify_metaobjects = client.list_all_designer_metaobjects_detailed()
-        except ShopifyGraphQLError as e:
-            logger.error("Impossible de lister les metaobjects : %s", e)
-            shopify_metaobjects = []
+        # Appels parallèles pour gagner du temps
+        mo_error: list[str] = []
+        lp_error: list[str] = []
 
-        total_metaobjects  = len(shopify_metaobjects)
-        with_name          = sum(1 for m in shopify_metaobjects if m.get("name"))
-        without_name       = total_metaobjects - with_name
-        with_image         = sum(1 for m in shopify_metaobjects if m.get("has_image"))
-        without_image      = total_metaobjects - with_image
-        with_wee_id        = sum(1 for m in shopify_metaobjects if m.get("wee_designer_id"))
+        def fetch_metaobjects() -> None:
+            nonlocal shopify_metaobjects
+            logger.info("  → Chargement metaobjects designer...")
+            try:
+                shopify_metaobjects = client.list_all_designer_metaobjects_detailed()
+                logger.info("  ✓ %d metaobject(s) chargé(s)", len(shopify_metaobjects))
+            except ShopifyGraphQLError as e:
+                mo_error.append(str(e))
+                logger.error("  ✗ Metaobjects : %s", e)
+
+        def fetch_linked_products() -> None:
+            nonlocal linked_products
+            logger.info("  → Chargement produits avec custom.designer...")
+            try:
+                linked_products = client.list_all_products_with_designer_metafield()
+                logger.info("  ✓ %d produit(s) lié(s) chargé(s)", len(linked_products))
+            except ShopifyGraphQLError as e:
+                lp_error.append(str(e))
+                logger.error("  ✗ Produits liés : %s", e)
+
+        t1 = threading.Thread(target=fetch_metaobjects)
+        t2 = threading.Thread(target=fetch_linked_products)
+        t1.start(); t2.start()
+        t1.join();  t2.join()
+
+        # ── Analyse metaobjects
+        total_mo       = len(shopify_metaobjects)
+        with_name      = sum(1 for m in shopify_metaobjects if m.get("name"))
+        without_name   = total_mo - with_name
+        with_image     = sum(1 for m in shopify_metaobjects if m.get("has_image"))
+        without_image  = total_mo - with_image
+        with_wee_id    = sum(1 for m in shopify_metaobjects if m.get("wee_designer_id"))
 
         shopify_wee_ids    = {m["wee_designer_id"] for m in shopify_metaobjects if m.get("wee_designer_id")}
         missing_in_shopify = unique_designers_csv - shopify_wee_ids
         orphan_in_shopify  = shopify_wee_ids - unique_designers_csv
 
-        logger.info("Metaobjects designer dans Shopify          : %d / %d source (%s)", total_metaobjects, len(unique_designers_csv), pct(total_metaobjects, len(unique_designers_csv)))
-        logger.info("  avec champ 'name' renseigné              : %d (%s)", with_name, pct(with_name, total_metaobjects))
-        logger.info("  SANS nom (problématique)                 : %d", without_name)
-        logger.info("  avec image                               : %d (%s)", with_image, pct(with_image, total_metaobjects))
-        logger.info("  sans image                               : %d", without_image)
-        logger.info("  avec wee_designer_id renseigné           : %d", with_wee_id)
-        sep()
-        logger.info("Designers dans CSV mais ABSENTS Shopify    : %d", len(missing_in_shopify))
-        if missing_in_shopify:
-            logger.info("  Exemples : %s", sorted(missing_in_shopify)[:10])
-        logger.info("Metaobjects Shopify ORPHELINS (hors CSV)   : %d", len(orphan_in_shopify))
+        divider()
+        logger.info("  METAOBJECTS DESIGNER")
+        progress_line("Créés dans Shopify", total_mo, len(unique_designers_csv))
+        progress_line("Avec nom renseigné", with_name, total_mo)
+        progress_line("Avec image attachée", with_image, total_mo)
+        logger.info("  Sans nom (problématique)               : %d", without_name)
+        logger.info("  Sans image                             : %d", without_image)
+        logger.info("  Manquants vs source CSV                : %d", len(missing_in_shopify))
+        logger.info("  Orphelins (hors CSV)                   : %d", len(orphan_in_shopify))
 
-        # Produits liés
-        logger.info("Chargement des produits avec custom.designer depuis Shopify...")
-        try:
-            linked_products = client.list_all_products_with_designer_metafield()
-        except ShopifyGraphQLError as e:
-            logger.error("Impossible de lister les produits liés : %s", e)
-            linked_products = []
+        # ── Analyse liaisons produits
+        total_linked  = len(linked_products)
+        linked_mo_ids = {p["metaobject_gid"] for p in linked_products}
+        mo_ids_set    = {m["id"] for m in shopify_metaobjects}
+        mo_used       = len(linked_mo_ids & mo_ids_set)
+        mo_unused     = total_mo - mo_used
 
-        total_linked   = len(linked_products)
-        linked_gids    = {p["metaobject_gid"] for p in linked_products}
-        # Métaobjects qui ont au moins un produit lié
-        metaobjects_used = linked_gids & {m["id"] for m in shopify_metaobjects}
-
-        logger.info("Produits avec custom.designer dans Shopify : %d (%s des liens possibles)", total_linked, pct(total_linked, links_with_mapping))
-        logger.info("Metaobjects utilisés (≥1 produit lié)      : %d / %d (%s)", len(metaobjects_used), total_metaobjects, pct(len(metaobjects_used), total_metaobjects))
-        logger.info("Metaobjects créés mais 0 produit lié       : %d", total_metaobjects - len(metaobjects_used))
+        divider()
+        logger.info("  LIAISONS PRODUITS")
+        progress_line("Produits liés dans Shopify", total_linked, links_with_mapping)
+        progress_line("Metaobjects avec ≥1 produit lié", mo_used, total_mo)
+        logger.info("  Metaobjects sans aucun produit lié     : %d", mo_unused)
 
         report["shopify"] = {
-            "total_metaobjects": total_metaobjects,
+            "total_metaobjects": total_mo,
             "metaobjects_with_name": with_name,
             "metaobjects_without_name": without_name,
             "metaobjects_with_image": with_image,
             "metaobjects_without_image": without_image,
+            "metaobjects_with_wee_id": with_wee_id,
             "missing_in_shopify": len(missing_in_shopify),
             "missing_wee_ids": sorted(missing_in_shopify)[:50],
             "orphan_in_shopify": len(orphan_in_shopify),
             "products_linked": total_linked,
-            "metaobjects_with_at_least_one_link": len(metaobjects_used),
-            "metaobjects_with_no_link": total_metaobjects - len(metaobjects_used),
+            "metaobjects_with_link": mo_used,
+            "metaobjects_without_link": mo_unused,
+            "errors": mo_error + lp_error,
         }
 
     # ── 4. ANALYSE CROISÉE ───────────────────────────────────────────────────
-    sep("4. ANALYSE CROISÉE")
+    section("4. ANALYSE CROISÉE")
 
     if not no_api:
         total_mo  = report["shopify"]["total_metaobjects"]
@@ -238,66 +284,117 @@ def run_audit(no_api: bool, output_json: bool) -> dict:
         total_lnk = report["shopify"]["products_linked"]
         possible  = report["source"]["links_with_mapping"]
 
-        logger.info("METAOBJECTS  : %d / %d créés  (%s)", total_mo, total_src, pct(total_mo, total_src))
-        logger.info("LIAISONS     : %d / %d faites (%s)", total_lnk, possible, pct(total_lnk, possible))
-        logger.info("IMAGES       : %d / %d attachées (%s)", report["shopify"]["metaobjects_with_image"], total_mo, pct(report["shopify"]["metaobjects_with_image"], total_mo))
+        stale_in_cache = {
+            wid for wid, v in import_state.items()
+            if v.get("shopify_metaobject_gid") and not v["shopify_metaobject_gid"].startswith("[DRY")
+            and wid not in shopify_wee_ids
+        }
 
-        # Liens restants à faire
+        remaining_mo    = total_src - total_mo
         remaining_links = possible - total_lnk
-        logger.info("Liens restants à faire                     : %d", remaining_links)
 
-        # Stale GIDs estimés (in cache but not in Shopify)
-        shopify_real_ids = {m["wee_designer_id"] for m in shopify_metaobjects if m.get("wee_designer_id")}
-        stale_in_cache   = {wid for wid, v in import_state.items()
-                            if v.get("shopify_metaobject_gid") and not v["shopify_metaobject_gid"].startswith("[DRY")
-                            and wid not in shopify_real_ids}
-        logger.info("GIDs obsolètes dans le cache               : %d", len(stale_in_cache))
+        logger.info("  GIDs obsolètes dans le cache           : %d", len(stale_in_cache))
         if stale_in_cache:
-            logger.info("  wee_designer_ids concernés : %s", sorted(stale_in_cache)[:20])
-    else:
-        logger.info("Analyse croisée ignorée sans --no-api.")
+            logger.info("    wee_designer_ids : %s", sorted(stale_in_cache)[:15])
+        logger.info("  Metaobjects encore à créer             : %d", remaining_mo)
+        logger.info("  Liens encore à faire                   : %d", remaining_links)
+        logger.info("  Liens impossibles (sans mapping)       : %d", links_without_mapping)
 
-    # ── 5. RECOMMANDATIONS ────────────────────────────────────────────────────
-    sep("5. RECOMMANDATIONS")
+        report["cross"] = {
+            "stale_gids_in_cache": len(stale_in_cache),
+            "stale_wee_ids": sorted(stale_in_cache),
+            "remaining_metaobjects": remaining_mo,
+            "remaining_links": remaining_links,
+            "impossible_links": links_without_mapping,
+        }
+    else:
+        logger.info("  (Ignoré sans --no-api)")
+        report["cross"] = {}
+
+    # ── 5. TABLEAU DE BORD ───────────────────────────────────────────────────
+    logger.info("")
+    logger.info("╔══════════════════════════════════════════════════════════════╗")
+    logger.info("║              TABLEAU DE BORD — AVANCEMENT GLOBAL            ║")
+    logger.info("╠══════════════════════════════════════════════════════════════╣")
+
+    if not no_api:
+        total_src = report["source"]["unique_designers"]
+        total_mo  = report["shopify"]["total_metaobjects"]
+        total_lnk = report["shopify"]["products_linked"]
+        possible  = report["source"]["links_with_mapping"]
+        total_img = report["shopify"]["metaobjects_with_image"]
+        map_ok    = report["source"]["mapped_products"]
+        map_total = report["source"]["unique_products_in_links"]
+
+        def dash_line(label: str, part: int, total: int) -> None:
+            bar = progress_bar(part, total, width=20)
+            logger.info("║  %-18s %s  ║", label, bar)
+
+        dash_line("METAOBJECTS", total_mo, total_src)
+        dash_line("LIAISONS", total_lnk, possible)
+        dash_line("IMAGES", total_img, total_mo)
+        dash_line("MAPPING PRODUITS", map_ok, map_total)
+    else:
+        map_ok    = report["source"]["mapped_products"]
+        map_total = report["source"]["unique_products_in_links"]
+        cache_ok  = report["cache"]["import_state_real_gids"]
+        total_src = report["source"]["unique_designers"]
+        link_ok   = report["cache"]["link_state_ok"]
+        possible  = report["source"]["links_with_mapping"]
+
+        def dash_line(label: str, part: int, total: int) -> None:
+            bar = progress_bar(part, total, width=20)
+            logger.info("║  %-18s %s  ║", label, bar)
+
+        dash_line("CACHE DESIGNERS", cache_ok, total_src)
+        dash_line("CACHE LIENS", link_ok, possible)
+        dash_line("MAPPING PRODUITS", map_ok, map_total)
+
+    logger.info("╚══════════════════════════════════════════════════════════════╝")
+
+    # ── 6. RECOMMANDATIONS ────────────────────────────────────────────────────
+    section("6. RECOMMANDATIONS")
+
+    actions: list[str] = []
 
     if not no_api:
         stale_count   = len(stale_in_cache)
         missing_count = report["shopify"]["missing_in_shopify"]
-        no_link_count = report["shopify"]["metaobjects_with_no_link"]
-        remaining     = possible - report["shopify"]["products_linked"]
+        remaining_lnk = possible - report["shopify"]["products_linked"]
+        no_img_count  = report["shopify"]["metaobjects_without_image"]
+        no_lnk_mo     = report["shopify"]["metaobjects_without_link"]
 
         if stale_count:
-            logger.info("⚠  %d GID(s) obsolètes en cache → relancez l'import pour les recréer automatiquement.", stale_count)
-        if missing_count:
-            logger.info("⚠  %d designer(s) manquants dans Shopify → relancez :", missing_count)
-            logger.info("     python import_designers_to_shopify.py --global-import --no-dry-run")
-        if remaining > 0:
-            logger.info("⚠  %d lien(s) produit restants → relancez l'import.", remaining)
-        if no_link_count:
-            logger.info("⚠  %d metaobject(s) sans aucun produit lié.", no_link_count)
-        if report["shopify"]["metaobjects_without_image"]:
-            logger.info("ℹ  %d metaobject(s) sans image → lancez :", report["shopify"]["metaobjects_without_image"])
-            logger.info("     python upload_images_to_shopify.py")
-            logger.info("     puis : python import_designers_to_shopify.py --global-import --no-dry-run")
-
-        if not stale_count and not missing_count and remaining == 0:
-            logger.info("✓  Import complet — aucune action requise.")
+            actions.append(f"⚠  {stale_count} GID(s) obsolètes → import les recrée automatiquement")
+        if missing_count or remaining_lnk:
+            actions.append("▶  python import_designers_to_shopify.py --global-import --no-dry-run")
+        if no_img_count:
+            actions.append(f"▶  python upload_images_to_shopify.py  ({no_img_count} images manquantes)")
+        if no_lnk_mo:
+            actions.append(f"ℹ  {no_lnk_mo} metaobject(s) sans produit lié (mapping absent ou produit retiré)")
+        if links_without_mapping:
+            actions.append(f"ℹ  {links_without_mapping} liens impossibles (produits non mappés dans Shopify)")
+        if not stale_count and not missing_count and remaining_lnk == 0:
+            actions.append("✓  Migration complète — aucune action requise.")
     else:
         if report["cache"]["import_state_dry_run"]:
-            logger.info("⚠  %d entrées dry-run dans le cache → relancez avec --no-dry-run.", report["cache"]["import_state_dry_run"])
-        if report["cache"]["designers_not_in_cache"]:
-            logger.info("⚠  %d designer(s) pas encore dans le cache.", report["cache"]["designers_not_in_cache"])
+            actions.append(f"⚠  {report['cache']['import_state_dry_run']} entrées dry-run → relancez avec --no-dry-run")
+        if designers_not_cached:
+            actions.append(f"⚠  {designers_not_cached} designer(s) pas encore importés")
+        actions.append("ℹ  Lancez sans --no-api pour l'état réel Shopify")
 
-    sep()
-    logger.info("Audit terminé : %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    for a in actions:
+        logger.info("  %s", a)
 
-    # ── JSON optionnel ────────────────────────────────────────────────────────
+    logger.info("")
+    logger.info("  Audit terminé : %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    # ── JSON ──────────────────────────────────────────────────────────────────
     if output_json:
         json_path = output_dir / "audit_report.json"
-        report["generated_at"] = datetime.now().isoformat()
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2, ensure_ascii=False)
-        logger.info("Rapport JSON sauvegardé : %s", json_path)
+        logger.info("  Rapport JSON : %s", json_path)
 
     return report
 
@@ -311,13 +408,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-api",
         action="store_true",
-        help="Ignore les appels Shopify — audit CSV/cache uniquement (rapide)",
+        help="CSV/cache uniquement — pas d'appel Shopify (rapide)",
     )
     parser.add_argument(
         "--json",
         action="store_true",
         dest="output_json",
-        help="Sauvegarde le rapport en JSON dans output/audit_report.json",
+        help="Export JSON dans output/audit_report.json",
     )
     return parser.parse_args()
 
