@@ -279,6 +279,25 @@ def _load_link_state(path: Path) -> set[tuple[str, str]]:
         }
 
 
+def _rewrite_link_state(valid_designer_ids: set[str], path: Path) -> int:
+    """
+    Réécrit link_state.csv en supprimant toutes les entrées
+    dont le wee_designer_id est dans stale_ids.
+    Retourne le nombre de lignes supprimées.
+    """
+    if not path.exists():
+        return 0
+    with open(path, "r", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    kept   = [r for r in rows if r.get("wee_designer_id") in valid_designer_ids]
+    purged = len(rows) - len(kept)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=_LINK_STATE_COLUMNS)
+        writer.writeheader()
+        writer.writerows(kept)
+    return purged
+
+
 def _append_link_state(key: tuple[str, str], status: str, path: Path) -> None:
     """Ajoute une ligne dans link_state.csv (append, pas de réécriture complète)."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -423,6 +442,58 @@ def _resolve_image_gid(
     else:
         logger.warning("  Upload échoué pour image id=%s.", image_id)
     return gid
+
+
+# ── Purge des GIDs obsolètes ──────────────────────────────────────────────────
+
+def purge_stale_cache(client: ShopifyClient, output_dir: Path) -> None:
+    """
+    Compare import_state.csv avec les metaobjects réellement présents dans Shopify.
+    Supprime du cache les entrées dont le GID n'existe plus.
+    Supprime aussi les liens correspondants dans link_state.csv.
+    """
+    import_state_path = output_dir / "import_state.csv"
+    link_state_path   = output_dir / "link_state.csv"
+
+    import_state = _load_import_state(import_state_path)
+    if not import_state:
+        logger.info("import_state.csv vide ou absent — rien à purger.")
+        return
+
+    logger.info("Récupération des metaobjects existants dans Shopify...")
+    shopify_entries = client.list_all_designer_metaobjects_detailed()
+    shopify_wee_ids = {e["wee_designer_id"] for e in shopify_entries if e.get("wee_designer_id")}
+    logger.info("Metaobjects Shopify trouvés : %d", len(shopify_wee_ids))
+
+    stale = {
+        wid for wid, v in import_state.items()
+        if v.get("shopify_metaobject_gid")
+        and not v["shopify_metaobject_gid"].startswith("[DRY")
+        and wid not in shopify_wee_ids
+    }
+
+    if not stale:
+        logger.info("Aucun GID obsolète détecté — cache déjà propre.")
+        return
+
+    logger.info("GIDs obsolètes détectés : %d / %d", len(stale), len(import_state))
+    logger.info("  Exemples : %s", sorted(stale)[:15])
+
+    # Purge import_state
+    for wid in stale:
+        del import_state[wid]
+    _rewrite_import_state(import_state, import_state_path)
+    logger.info("import_state.csv réécrit : %d entrée(s) restantes", len(import_state))
+
+    # Purge link_state (supprime les liens des designers stale)
+    valid_ids = set(import_state.keys())
+    purged_links = _rewrite_link_state(valid_ids, link_state_path)
+    logger.info("link_state.csv : %d lien(s) stale supprimés", purged_links)
+
+    logger.info(
+        "Purge terminée. Relancez :\n"
+        "  python import_designers_to_shopify.py --global-import --no-dry-run"
+    )
 
 
 # ── Logique principale ────────────────────────────────────────────────────────
@@ -1014,6 +1085,16 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Supprime import_state.csv, link_state.csv et image_gid_map.csv puis quitte",
     )
+    parser.add_argument(
+        "--purge-stale",
+        action="store_true",
+        dest="purge_stale",
+        default=False,
+        help=(
+            "Interroge Shopify, retire du cache les GIDs qui n'existent plus, "
+            "puis quitte. Relancez ensuite --global-import --no-dry-run."
+        ),
+    )
 
     return parser.parse_args()
 
@@ -1038,6 +1119,11 @@ def main() -> None:
             else:
                 logger.info("Cache absent (rien a supprimer) : %s", f)
         logger.info("--reset-cache termine.")
+        return
+
+    if getattr(args, "purge_stale", False):
+        client = ShopifyClient(dry_run=False)
+        purge_stale_cache(client, output_dir)
         return
 
     global_mode = getattr(args, "global_import", False)
