@@ -66,6 +66,93 @@ def get_drive_service():
     return build("drive", "v3", credentials=creds)
 
 
+def build_drive_index(service, folder_id: str, max_depth: int = 6) -> dict[str, str]:
+    """
+    Construit un index récursif {filename: file_id} sous folder_id.
+    Descend dans tous les sous-dossiers jusqu'à max_depth niveaux.
+    Retourne un dict prêt pour find_in_index().
+    """
+    index: dict[str, str] = {}
+    _index_folder(service, folder_id, index, depth=0, max_depth=max_depth)
+    logger.info("Index Drive construit : %d fichier(s) trouvé(s)", len(index))
+    return index
+
+
+def _index_folder(service, folder_id: str, index: dict, depth: int, max_depth: int) -> None:
+    if depth > max_depth:
+        return
+
+    page_token = None
+    while True:
+        result = service.files().list(
+            q=f"'{folder_id}' in parents and trashed=false",
+            fields="nextPageToken, files(id, name, mimeType)",
+            pageSize=1000,
+            pageToken=page_token,
+            includeItemsFromAllDrives=True,
+            supportsAllDrives=True,
+        ).execute()
+
+        for f in result.get("files", []):
+            if f["mimeType"] == "application/vnd.google-apps.folder":
+                _index_folder(service, f["id"], index, depth + 1, max_depth)
+            else:
+                name = f["name"]
+                if name not in index:
+                    index[name] = f["id"]
+
+        page_token = result.get("nextPageToken")
+        if not page_token:
+            break
+
+
+def find_in_index(
+    index: dict[str, str],
+    image_id: str,
+    image_ext: str,
+) -> tuple[str | None, str | None]:
+    """
+    Cherche image_id dans l'index Drive avec fallback progressif.
+    Retourne (file_id, matched_filename) ou (None, None).
+
+    Ordre de priorité :
+      1. Exact         : {image_id}.{image_ext}
+      2. Autre ext     : {image_id}.jpg/png/jpeg/webp/gif
+      3. Préfixe flou  : nom commençant par {image_id}_ ou {image_id}-
+    """
+    # 1. Exact
+    exact = f"{image_id}.{image_ext}"
+    if exact in index:
+        return index[exact], exact
+
+    # 2. Même ID, autre extension
+    for ext in ("jpg", "jpeg", "png", "webp", "gif"):
+        name = f"{image_id}.{ext}"
+        if name in index:
+            return index[name], name
+
+    # 3. Préfixe flou
+    prefix_dash  = f"{image_id}-"
+    prefix_under = f"{image_id}_"
+    for fname, fid in index.items():
+        if fname.startswith(prefix_dash) or fname.startswith(prefix_under):
+            return fid, fname
+
+    return None, None
+
+
+def download_by_id(service, file_id: str) -> bytes | None:
+    """Télécharge un fichier Google Drive par son ID."""
+    from googleapiclient.http import MediaIoBaseDownload
+    request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
+    buffer = io.BytesIO()
+    downloader = MediaIoBaseDownload(buffer, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    return buffer.getvalue()
+
+
 def find_folder_id(service, folder_name: str) -> str | None:
     """Trouve l'ID d'un dossier Google Drive par son nom (My Drive + Shared Drives)."""
     result = service.files().list(

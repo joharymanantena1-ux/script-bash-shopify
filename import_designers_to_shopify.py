@@ -22,6 +22,7 @@ Usage :
   python import_designers_to_shopify.py --test --no-dry-run
   python import_designers_to_shopify.py --global-import --dry-run
   python import_designers_to_shopify.py --global-import --no-dry-run
+  python import_designers_to_shopify.py --global-import --no-dry-run --force-update
   python import_designers_to_shopify.py --test --preview
   python import_designers_to_shopify.py --test --reset-cache
 """
@@ -613,6 +614,7 @@ def link_products(
     import_state: dict | None = None,
     state_path: Path | None = None,
     designers_by_id: dict | None = None,
+    force_update: bool = False,
 ) -> None:
     """
     Phase 2 : lie chaque produit Shopify à son metaobject designer via metafield.
@@ -688,8 +690,28 @@ def link_products(
 
         try:
             existing_mf = client.get_product_metafield(product_gid, "custom", "designer")
-            action = "updated" if existing_mf else "created"
 
+            if existing_mf and not force_update:
+                # Mode MERGE : liaison déjà présente → on préserve sans écraser
+                logger.debug(
+                    "Liaison déjà présente sur produit %s (designer %s) — préservée (mode merge).",
+                    wee_product_id, wee_designer_id,
+                )
+                report.add(
+                    wee_designer_id=wee_designer_id,
+                    wee_product_id=wee_product_id,
+                    shopify_product_gid=product_gid,
+                    shopify_metaobject_gid=existing_mf,
+                    action_metafield="preserved",
+                    statut="ok",
+                    message="merge: liaison existante préservée",
+                )
+                done_links.add(link_key)
+                _append_link_state(link_key, "ok", link_state_path)
+                skipped_links += 1
+                continue
+
+            action = "updated" if existing_mf else "created"
             client.set_product_metafield(
                 product_gid=product_gid,
                 namespace="custom",
@@ -966,6 +988,18 @@ def parse_args() -> argparse.Namespace:
         help="Active l'écriture réelle Shopify (IRRÉVERSIBLE)",
     )
 
+    # Merge mode
+    parser.add_argument(
+        "--force-update",
+        action="store_true",
+        dest="force_update",
+        default=False,
+        help=(
+            "Écrase les liaisons produit-designer existantes. "
+            "Par défaut (sans ce flag) : mode MERGE — ne touche pas les liaisons déjà présentes."
+        ),
+    )
+
     # Utilitaires
     parser.add_argument(
         "--preview",
@@ -1054,8 +1088,13 @@ def main() -> None:
     id_to_gid, import_state, state_path, designers_by_id = import_designers(designers, links, client, report, test_product_id)
 
     # Phase 2 — Metafields produit
+    force_update = getattr(args, "force_update", False)
+    if force_update:
+        logger.warning(">>> MODE --force-update : les liaisons produit existantes seront écrasées <<<")
+    else:
+        logger.info(">>> MODE MERGE (défaut) : les liaisons existantes sont préservées <<<")
     logger.info("--- Phase 2 : Liaison produits <-> Designer ---")
-    link_products(links, id_to_gid, client, report, test_product_id, import_state, state_path, designers_by_id)
+    link_products(links, id_to_gid, client, report, test_product_id, import_state, state_path, designers_by_id, force_update)
 
     # Rapport final
     report.save()
