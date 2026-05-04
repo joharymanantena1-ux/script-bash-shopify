@@ -66,45 +66,69 @@ def get_drive_service():
     return build("drive", "v3", credentials=creds)
 
 
-def build_drive_index(service, folder_id: str, max_depth: int = 6) -> dict[str, str]:
+def build_drive_index(service, folder_id: str, drive_id: str | None = None) -> dict[str, str]:
     """
-    Construit un index {filename: file_id} pour tous les fichiers sous folder_id.
+    Construit un index {filename: file_id} en une seule passe paginée.
 
-    Utilise 'ancestors' pour récupérer tout l'arbre en une seule passe paginée
-    (au lieu d'une requête par sous-dossier), ce qui est ~10× plus rapide.
+    Si drive_id est fourni (Shared Drive) : utilise corpora=drive pour lister
+    tous les fichiers du drive en une passe — rapide, pas de récursion.
+    Sinon (My Drive) : scan récursif des sous-dossiers.
     """
     index: dict[str, str] = {}
-    query = (
-        f"'{folder_id}' in ancestors "
-        "and mimeType != 'application/vnd.google-apps.folder' "
-        "and trashed=false"
-    )
-    page_token = None
-    page = 0
-    while True:
-        page += 1
-        result = service.files().list(
-            q=query,
-            fields="nextPageToken, files(id, name)",
-            pageSize=1000,
-            pageToken=page_token,
-            includeItemsFromAllDrives=True,
-            supportsAllDrives=True,
-        ).execute()
 
-        for f in result.get("files", []):
-            name = f["name"]
-            if name not in index:
-                index[name] = f["id"]
-
-        page_token = result.get("nextPageToken")
-        if page % 5 == 0 or not page_token:
-            logger.info("Index Drive : page %d — %d fichier(s) indexé(s)...", page, len(index))
-        if not page_token:
-            break
+    if drive_id:
+        # Shared Drive : une seule passe sur tout le drive
+        page_token = None
+        page = 0
+        while True:
+            page += 1
+            result = service.files().list(
+                q="mimeType != 'application/vnd.google-apps.folder' and trashed=false",
+                corpora="drive",
+                driveId=drive_id,
+                fields="nextPageToken, files(id, name)",
+                pageSize=1000,
+                pageToken=page_token,
+                includeItemsFromAllDrives=True,
+                supportsAllDrives=True,
+            ).execute()
+            for f in result.get("files", []):
+                name = f["name"]
+                if name not in index:
+                    index[name] = f["id"]
+            page_token = result.get("nextPageToken")
+            if page % 5 == 0 or not page_token:
+                logger.info("Index Drive : page %d — %d fichier(s)...", page, len(index))
+            if not page_token:
+                break
+    else:
+        # My Drive : scan récursif
+        _index_folder_recursive(service, folder_id, index)
 
     logger.info("Index Drive construit : %d fichier(s) au total", len(index))
     return index
+
+
+def _index_folder_recursive(service, folder_id: str, index: dict, depth: int = 0) -> None:
+    """Scan récursif d'un dossier My Drive (fallback quand drive_id inconnu)."""
+    if depth > 8:
+        return
+    page_token = None
+    while True:
+        result = service.files().list(
+            q=f"'{folder_id}' in parents and trashed=false",
+            fields="nextPageToken, files(id, name, mimeType)",
+            pageSize=1000,
+            pageToken=page_token,
+        ).execute()
+        for f in result.get("files", []):
+            if f["mimeType"] == "application/vnd.google-apps.folder":
+                _index_folder_recursive(service, f["id"], index, depth + 1)
+            elif f["name"] not in index:
+                index[f["name"]] = f["id"]
+        page_token = result.get("nextPageToken")
+        if not page_token:
+            break
 
 
 def find_in_index(
@@ -154,8 +178,11 @@ def download_by_id(service, file_id: str) -> bytes | None:
     return buffer.getvalue()
 
 
-def find_folder_id(service, folder_name: str) -> str | None:
-    """Trouve l'ID d'un dossier Google Drive par son nom (My Drive + Shared Drives)."""
+def find_folder_info(service, folder_name: str) -> tuple[str | None, str | None]:
+    """
+    Trouve un dossier Google Drive par son nom.
+    Retourne (folder_id, drive_id) — drive_id est None pour My Drive.
+    """
     result = service.files().list(
         q=(
             f"name='{folder_name}' "
@@ -169,15 +196,20 @@ def find_folder_id(service, folder_name: str) -> str | None:
     ).execute()
     folders = result.get("files", [])
     if not folders:
-        logger.warning("Dossier Google Drive '%s' introuvable (My Drive + Shared Drives).", folder_name)
-        return None
+        logger.warning("Dossier Google Drive '%s' introuvable.", folder_name)
+        return None, None
     if len(folders) > 1:
-        logger.warning(
-            "%d dossiers '%s' trouvés — utilisation du premier.", len(folders), folder_name
-        )
-    drive_label = folders[0].get("driveId", "MyDrive")
-    logger.info("Dossier Drive '%s' : %s (drive=%s)", folder_name, folders[0]["id"], drive_label)
-    return folders[0]["id"]
+        logger.warning("%d dossiers '%s' trouvés — utilisation du premier.", len(folders), folder_name)
+    folder_id = folders[0]["id"]
+    drive_id   = folders[0].get("driveId") or None
+    logger.info("Dossier Drive '%s' : %s (drive=%s)", folder_name, folder_id, drive_id or "MyDrive")
+    return folder_id, drive_id
+
+
+def find_folder_id(service, folder_name: str) -> str | None:
+    """Rétrocompatibilité — retourne uniquement folder_id."""
+    folder_id, _ = find_folder_info(service, folder_name)
+    return folder_id
 
 
 def find_file(service, filename: str, folder_id: str | None) -> bool:

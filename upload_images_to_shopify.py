@@ -136,12 +136,12 @@ def main() -> None:
         logger.error("Google Drive non disponible — vérifiez credential-regardbeauty.json")
         sys.exit(1)
 
-    folder_id = google_drive.find_folder_id(drive, config.GOOGLE_DRIVE_FOLDER_NAME)
+    folder_id, drive_id = google_drive.find_folder_info(drive, config.GOOGLE_DRIVE_FOLDER_NAME)
 
-    # Index récursif (scan tous les sous-dossiers une seule fois)
-    logger.info("Construction de l'index Drive récursif (scan sous-dossiers)...")
+    # Index fichiers (une passe sur le Shared Drive ou scan récursif MyDrive)
+    logger.info("Construction de l'index Drive...")
     if folder_id:
-        drive_index = google_drive.build_drive_index(drive, folder_id)
+        drive_index = google_drive.build_drive_index(drive, folder_id, drive_id=drive_id)
     else:
         logger.warning("Dossier Drive introuvable — recherche fichier par fichier (lent).")
         drive_index = {}
