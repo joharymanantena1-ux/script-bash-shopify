@@ -87,10 +87,19 @@ def search_file_by_name(service, filename: str) -> tuple[str | None, str | None]
     return None, None
 
 
-def search_file_by_id(service, image_id: str, image_ext: str) -> tuple[str | None, str | None]:
+def search_file_by_id(
+    service,
+    image_id: str,
+    image_ext: str,
+    master_folder_id: str | None = None,
+) -> tuple[str | None, str | None]:
     """
-    Recherche une image dans Drive par son image_id (cherche dans tous les drives).
-    Essaie : exact → autres extensions communes → name contains.
+    Recherche une image dans Drive par son image_id.
+    Stratégies dans l'ordre :
+      1. Exact global : name='{image_id}.{ext}' (toutes extensions)
+      2. Sous-dossiers de master/ : liste les sous-dossiers, cherche {image_id}.{ext} dedans
+      3. Fuzzy global : name contains '{image_id}' (fichier ou dossier portant cet ID)
+      4. Fichier dans un dossier nommé '{image_id}' (structure master/XXXX/{image_id}/image.jpg)
     Retourne (file_id, matched_filename) ou (None, None).
     """
     candidates = [f"{image_id}.{image_ext}"]
@@ -99,7 +108,7 @@ def search_file_by_id(service, image_id: str, image_ext: str) -> tuple[str | Non
         if name not in candidates:
             candidates.append(name)
 
-    # 1. Recherche exacte pour chaque extension
+    # 1. Recherche exacte globale pour chaque extension
     for name in candidates:
         result = service.files().list(
             q=f"name='{name}' and trashed=false",
@@ -112,7 +121,34 @@ def search_file_by_id(service, image_id: str, image_ext: str) -> tuple[str | Non
         if files:
             return files[0]["id"], files[0]["name"]
 
-    # 2. Recherche par préfixe (name contains)
+    # 2. Recherche ciblée dans les sous-dossiers de master/ (master/0000/, master/0001/…)
+    if master_folder_id:
+        sub_result = service.files().list(
+            q=(
+                f"'{master_folder_id}' in parents "
+                "and mimeType='application/vnd.google-apps.folder' "
+                "and trashed=false"
+            ),
+            fields="files(id, name)",
+            pageSize=100,
+            includeItemsFromAllDrives=True,
+            supportsAllDrives=True,
+        ).execute()
+        for subfolder in sub_result.get("files", []):
+            sfid = subfolder["id"]
+            for name in candidates:
+                r = service.files().list(
+                    q=f"name='{name}' and '{sfid}' in parents and trashed=false",
+                    fields="files(id, name)",
+                    pageSize=1,
+                    includeItemsFromAllDrives=True,
+                    supportsAllDrives=True,
+                ).execute()
+                hits = r.get("files", [])
+                if hits:
+                    return hits[0]["id"], hits[0]["name"]
+
+    # 3. Fuzzy global : name contains '{image_id}'
     result = service.files().list(
         q=f"name contains '{image_id}' and trashed=false and mimeType != 'application/vnd.google-apps.folder'",
         fields="files(id, name)",
@@ -124,6 +160,35 @@ def search_file_by_id(service, image_id: str, image_ext: str) -> tuple[str | Non
         stem = f["name"].rsplit(".", 1)[0]
         if stem == image_id or f["name"].startswith(f"{image_id}_") or f["name"].startswith(f"{image_id}-"):
             return f["id"], f["name"]
+
+    # 4. Dossier nommé '{image_id}' → premier fichier image à l'intérieur
+    #    (structure : master/XXXX/{image_id}/original.jpg)
+    folder_result = service.files().list(
+        q=(
+            f"name='{image_id}' "
+            "and mimeType='application/vnd.google-apps.folder' "
+            "and trashed=false"
+        ),
+        fields="files(id, name)",
+        pageSize=1,
+        includeItemsFromAllDrives=True,
+        supportsAllDrives=True,
+    ).execute()
+    for folder in folder_result.get("files", []):
+        img_result = service.files().list(
+            q=(
+                f"'{folder['id']}' in parents "
+                "and trashed=false "
+                "and (mimeType contains 'image/' or name contains '.jpg' or name contains '.png')"
+            ),
+            fields="files(id, name)",
+            pageSize=1,
+            includeItemsFromAllDrives=True,
+            supportsAllDrives=True,
+        ).execute()
+        imgs = img_result.get("files", [])
+        if imgs:
+            return imgs[0]["id"], imgs[0]["name"]
 
     return None, None
 

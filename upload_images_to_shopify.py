@@ -110,24 +110,21 @@ def main() -> None:
         all_designers = [d for d in all_designers if str(d["wee_designer_id"]) in relevant_ids]
         logger.info("Mode test : %d designer(s) pour product_id=%s", len(all_designers), config.TEST_PRODUCT_ID)
 
-    # Clé de cache = str(image_id)  |  valeur = image_file (signature.ext, le vrai nom Drive)
-    unique_id_to_file: dict[str, str] = {}
+    # Clé de cache = str(image_id)  |  le fichier Drive est nommé {image_id}.{ext}
+    unique_id_to_ext: dict[str, str] = {}
     for d in all_designers:
-        image_id   = str(d.get("image_id", "")).strip()
-        image_file = str(d.get("image_file", "") or "").strip()
-        image_ext  = (d.get("image_ext", "") or "jpg").strip()
+        image_id  = str(d.get("image_id", "")).strip()
+        image_ext = (d.get("image_ext", "") or "jpg").strip()
         if image_id:
-            # image_file = "{signature}.{ext}" — c'est le vrai nom du fichier Drive
-            # Fallback si absent : on reconstitue avec l'ID (cas legacy)
-            unique_id_to_file[image_id] = image_file if image_file else f"{image_id}.{image_ext}"
+            unique_id_to_ext[image_id] = image_ext
 
-    logger.info("Images uniques à traiter : %d", len(unique_id_to_file))
+    logger.info("Images uniques à traiter : %d", len(unique_id_to_ext))
 
     gid_map   = load_existing_map(gid_map_csv)
     sources: dict[str, str] = {}
-    to_process = {k: v for k, v in unique_id_to_file.items() if k not in gid_map}
+    to_process = {k: v for k, v in unique_id_to_ext.items() if k not in gid_map}
     logger.info("Déjà dans le cache : %d  |  À traiter : %d",
-                len(unique_id_to_file) - len(to_process), len(to_process))
+                len(unique_id_to_ext) - len(to_process), len(to_process))
 
     if not to_process:
         logger.info("Toutes les images sont déjà en cache.")
@@ -139,6 +136,13 @@ def main() -> None:
         logger.error("Google Drive non disponible — vérifiez credential-regardbeauty.json")
         sys.exit(1)
 
+    # Pré-charge l'ID du dossier master/ pour les recherches ciblées
+    master_folder_id = google_drive.find_folder_id(drive, "master")
+    if master_folder_id:
+        logger.info("Dossier 'master' trouvé dans Drive : %s", master_folder_id)
+    else:
+        logger.warning("Dossier 'master' introuvable — recherche globale uniquement.")
+
     client = ShopifyClient(dry_run=args.dry_run)
     if args.dry_run:
         logger.info("[DRY-RUN] fileCreate désactivé.")
@@ -147,26 +151,24 @@ def main() -> None:
     fuzzy_log: list[str] = []
     total = len(to_process)
 
-    for idx, (image_id, image_file) in enumerate(sorted(to_process.items()), 1):
-        logger.info("[%d/%d] %s", idx, total, image_file)
+    for idx, (image_id, image_ext) in enumerate(sorted(to_process.items()), 1):
+        canonical = f"{image_id}.{image_ext}"
+        logger.info("[%d/%d] %s", idx, total, canonical)
 
-        # 1. Recherche par nom exact (signature.ext depuis la DB)
-        file_id, matched_name = google_drive.search_file_by_name(drive, image_file)
-
-        # 2. Fallback : si image_file = "{image_id}.{ext}" ou introuvable → recherche par préfixe
-        if not file_id:
-            image_ext = image_file.rsplit(".", 1)[-1] if "." in image_file else "jpg"
-            file_id, matched_name = google_drive.search_file_by_id(drive, image_id, image_ext)
+        # Recherche : exact par image_id + fallback dossier master/ + fuzzy
+        file_id, matched_name = google_drive.search_file_by_id(
+            drive, image_id, image_ext, master_folder_id=master_folder_id
+        )
 
         if not file_id:
-            logger.warning("  Introuvable dans Drive : %s", image_file)
+            logger.warning("  Introuvable dans Drive : %s", canonical)
             nf_count += 1
             continue
 
-        is_fuzzy = matched_name != image_file
+        is_fuzzy = matched_name != canonical
         if is_fuzzy:
-            logger.info("  Fuzzy : '%s' → '%s'", image_file, matched_name)
-            fuzzy_log.append(f"{image_file} → {matched_name}")
+            logger.info("  Fuzzy : '%s' → '%s'", canonical, matched_name)
+            fuzzy_log.append(f"{canonical} → {matched_name}")
             fuzzy_count += 1
 
         if args.dry_run:
