@@ -136,10 +136,13 @@ def main() -> None:
         logger.error("Google Drive non disponible — vérifiez credential-regardbeauty.json")
         sys.exit(1)
 
-    # Pré-charge l'ID du dossier master/ pour les recherches ciblées
+    # Construction de l'index des buckets master/XXXX/ — fait une seule fois
     master_folder_id = google_drive.find_folder_id(drive, "master")
+    bucket_index: dict[str, str] = {}
     if master_folder_id:
-        logger.info("Dossier 'master' trouvé dans Drive : %s", master_folder_id)
+        logger.info("Dossier 'master' trouvé — construction de l'index des buckets...")
+        bucket_index = google_drive.build_bucket_index(drive, master_folder_id)
+        logger.info("Index prêt : %d bucket(s) (ex: 0021 → master/.../0021/)", len(bucket_index))
     else:
         logger.warning("Dossier 'master' introuvable — recherche globale uniquement.")
 
@@ -155,9 +158,9 @@ def main() -> None:
         canonical = f"{image_id}.{image_ext}"
         logger.info("[%d/%d] %s", idx, total, canonical)
 
-        # Recherche : exact par image_id + fallback dossier master/ + fuzzy
+        # Recherche : bucket ciblé → exact global → fuzzy
         file_id, matched_name = google_drive.search_file_by_id(
-            drive, image_id, image_ext, master_folder_id=master_folder_id
+            drive, image_id, image_ext, bucket_index=bucket_index
         )
 
         if not file_id:

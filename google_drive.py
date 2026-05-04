@@ -66,6 +66,48 @@ def get_drive_service():
     return build("drive", "v3", credentials=creds)
 
 
+def _list_subfolders(service, parent_id: str) -> dict[str, str]:
+    """Retourne {subfolder_name: folder_id} pour tous les sous-dossiers directs d'un dossier."""
+    result = service.files().list(
+        q=(
+            f"'{parent_id}' in parents "
+            "and mimeType='application/vnd.google-apps.folder' "
+            "and trashed=false"
+        ),
+        fields="files(id, name)",
+        pageSize=200,
+        includeItemsFromAllDrives=True,
+        supportsAllDrives=True,
+    ).execute()
+    return {f["name"]: f["id"] for f in result.get("files", [])}
+
+
+def build_bucket_index(service, master_folder_id: str) -> dict[str, str]:
+    """
+    Construit {bucket_name: folder_id} en listant :
+      - Les sous-dossiers directs de master/  (ex: master/0021/)
+      - Les sous-dossiers de chaque niveau 1  (ex: master/0000/0021/)
+    Retourne un dict plat  {"0021": "<folder_id>", "0025": "<folder_id>", ...}
+    Le bucket d'un image_id numérique se calcule : f"{int(image_id) // 10000:04d}"
+    """
+    index: dict[str, str] = {}
+    level1 = _list_subfolders(service, master_folder_id)
+    logger.info("  Sous-dossiers directs de master/ : %d", len(level1))
+
+    for name1, fid1 in level1.items():
+        # Niveau 1 — peut être un bucket direct (ex: master/0021/)
+        if name1 not in index:
+            index[name1] = fid1
+        # Niveau 2 — ex: master/0000/0021/
+        level2 = _list_subfolders(service, fid1)
+        for name2, fid2 in level2.items():
+            if name2 not in index:
+                index[name2] = fid2
+
+    logger.info("  Buckets indexés (niveau 1+2) : %d", len(index))
+    return index
+
+
 def search_file_by_name(service, filename: str) -> tuple[str | None, str | None]:
     """
     Recherche un fichier Drive par son nom exact.
@@ -91,15 +133,16 @@ def search_file_by_id(
     service,
     image_id: str,
     image_ext: str,
+    bucket_index: dict[str, str] | None = None,
     master_folder_id: str | None = None,
 ) -> tuple[str | None, str | None]:
     """
-    Recherche une image dans Drive par son image_id.
+    Recherche une image dans Drive par son image_id (numérique).
     Stratégies dans l'ordre :
-      1. Exact global : name='{image_id}.{ext}' (toutes extensions)
-      2. Sous-dossiers de master/ : liste les sous-dossiers, cherche {image_id}.{ext} dedans
-      3. Fuzzy global : name contains '{image_id}' (fichier ou dossier portant cet ID)
-      4. Fichier dans un dossier nommé '{image_id}' (structure master/XXXX/{image_id}/image.jpg)
+      1. Bucket ciblé  : calcule master/XXXX/{bucket}/{image_id}.{ext}
+         où bucket = f"{int(image_id) // 10000:04d}" — O(1), sans scan
+      2. Exact global  : name='{image_id}.{ext}' toutes extensions
+      3. Fuzzy global  : name contains '{image_id}' (tiret/underscore)
     Retourne (file_id, matched_filename) ou (None, None).
     """
     candidates = [f"{image_id}.{image_ext}"]
@@ -108,7 +151,24 @@ def search_file_by_id(
         if name not in candidates:
             candidates.append(name)
 
-    # 1. Recherche exacte globale pour chaque extension
+    # 1. Bucket ciblé : O(1) calcul, 1 seul appel API par image
+    if bucket_index and image_id.isdigit():
+        bucket = f"{int(image_id) // 10000:04d}"
+        bucket_folder_id = bucket_index.get(bucket)
+        if bucket_folder_id:
+            for name in candidates:
+                r = service.files().list(
+                    q=f"name='{name}' and '{bucket_folder_id}' in parents and trashed=false",
+                    fields="files(id, name)",
+                    pageSize=1,
+                    includeItemsFromAllDrives=True,
+                    supportsAllDrives=True,
+                ).execute()
+                hits = r.get("files", [])
+                if hits:
+                    return hits[0]["id"], hits[0]["name"]
+
+    # 2. Exact global (fallback si bucket non trouvé)
     for name in candidates:
         result = service.files().list(
             q=f"name='{name}' and trashed=false",
@@ -121,34 +181,7 @@ def search_file_by_id(
         if files:
             return files[0]["id"], files[0]["name"]
 
-    # 2. Recherche ciblée dans les sous-dossiers de master/ (master/0000/, master/0001/…)
-    if master_folder_id:
-        sub_result = service.files().list(
-            q=(
-                f"'{master_folder_id}' in parents "
-                "and mimeType='application/vnd.google-apps.folder' "
-                "and trashed=false"
-            ),
-            fields="files(id, name)",
-            pageSize=100,
-            includeItemsFromAllDrives=True,
-            supportsAllDrives=True,
-        ).execute()
-        for subfolder in sub_result.get("files", []):
-            sfid = subfolder["id"]
-            for name in candidates:
-                r = service.files().list(
-                    q=f"name='{name}' and '{sfid}' in parents and trashed=false",
-                    fields="files(id, name)",
-                    pageSize=1,
-                    includeItemsFromAllDrives=True,
-                    supportsAllDrives=True,
-                ).execute()
-                hits = r.get("files", [])
-                if hits:
-                    return hits[0]["id"], hits[0]["name"]
-
-    # 3. Fuzzy global : name contains '{image_id}'
+    # 3. Fuzzy : name contains '{image_id}' (capture {image_id}_v2.jpg etc.)
     result = service.files().list(
         q=f"name contains '{image_id}' and trashed=false and mimeType != 'application/vnd.google-apps.folder'",
         fields="files(id, name)",
@@ -160,35 +193,6 @@ def search_file_by_id(
         stem = f["name"].rsplit(".", 1)[0]
         if stem == image_id or f["name"].startswith(f"{image_id}_") or f["name"].startswith(f"{image_id}-"):
             return f["id"], f["name"]
-
-    # 4. Dossier nommé '{image_id}' → premier fichier image à l'intérieur
-    #    (structure : master/XXXX/{image_id}/original.jpg)
-    folder_result = service.files().list(
-        q=(
-            f"name='{image_id}' "
-            "and mimeType='application/vnd.google-apps.folder' "
-            "and trashed=false"
-        ),
-        fields="files(id, name)",
-        pageSize=1,
-        includeItemsFromAllDrives=True,
-        supportsAllDrives=True,
-    ).execute()
-    for folder in folder_result.get("files", []):
-        img_result = service.files().list(
-            q=(
-                f"'{folder['id']}' in parents "
-                "and trashed=false "
-                "and (mimeType contains 'image/' or name contains '.jpg' or name contains '.png')"
-            ),
-            fields="files(id, name)",
-            pageSize=1,
-            includeItemsFromAllDrives=True,
-            supportsAllDrives=True,
-        ).execute()
-        imgs = img_result.get("files", [])
-        if imgs:
-            return imgs[0]["id"], imgs[0]["name"]
 
     return None, None
 
