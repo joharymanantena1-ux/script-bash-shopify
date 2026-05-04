@@ -66,69 +66,45 @@ def get_drive_service():
     return build("drive", "v3", credentials=creds)
 
 
-def build_drive_index(service, folder_id: str, drive_id: str | None = None) -> dict[str, str]:
+def search_file_by_id(service, image_id: str, image_ext: str) -> tuple[str | None, str | None]:
     """
-    Construit un index {filename: file_id} en une seule passe paginée.
-
-    Si drive_id est fourni (Shared Drive) : utilise corpora=drive pour lister
-    tous les fichiers du drive en une passe — rapide, pas de récursion.
-    Sinon (My Drive) : scan récursif des sous-dossiers.
+    Recherche une image dans Drive par son image_id (cherche dans tous les drives).
+    Essaie : exact → autres extensions communes → name contains.
+    Retourne (file_id, matched_filename) ou (None, None).
     """
-    index: dict[str, str] = {}
+    candidates = [f"{image_id}.{image_ext}"]
+    for ext in ("jpg", "jpeg", "png", "webp", "gif"):
+        name = f"{image_id}.{ext}"
+        if name not in candidates:
+            candidates.append(name)
 
-    if drive_id:
-        # Shared Drive : une seule passe sur tout le drive
-        page_token = None
-        page = 0
-        while True:
-            page += 1
-            result = service.files().list(
-                q="mimeType != 'application/vnd.google-apps.folder' and trashed=false",
-                corpora="drive",
-                driveId=drive_id,
-                fields="nextPageToken, files(id, name)",
-                pageSize=1000,
-                pageToken=page_token,
-                includeItemsFromAllDrives=True,
-                supportsAllDrives=True,
-            ).execute()
-            for f in result.get("files", []):
-                name = f["name"]
-                if name not in index:
-                    index[name] = f["id"]
-            page_token = result.get("nextPageToken")
-            if page % 5 == 0 or not page_token:
-                logger.info("Index Drive : page %d — %d fichier(s)...", page, len(index))
-            if not page_token:
-                break
-    else:
-        # My Drive : scan récursif
-        _index_folder_recursive(service, folder_id, index)
-
-    logger.info("Index Drive construit : %d fichier(s) au total", len(index))
-    return index
-
-
-def _index_folder_recursive(service, folder_id: str, index: dict, depth: int = 0) -> None:
-    """Scan récursif d'un dossier My Drive (fallback quand drive_id inconnu)."""
-    if depth > 8:
-        return
-    page_token = None
-    while True:
+    # 1. Recherche exacte pour chaque extension
+    for name in candidates:
         result = service.files().list(
-            q=f"'{folder_id}' in parents and trashed=false",
-            fields="nextPageToken, files(id, name, mimeType)",
-            pageSize=1000,
-            pageToken=page_token,
+            q=f"name='{name}' and trashed=false",
+            fields="files(id, name)",
+            pageSize=1,
+            includeItemsFromAllDrives=True,
+            supportsAllDrives=True,
         ).execute()
-        for f in result.get("files", []):
-            if f["mimeType"] == "application/vnd.google-apps.folder":
-                _index_folder_recursive(service, f["id"], index, depth + 1)
-            elif f["name"] not in index:
-                index[f["name"]] = f["id"]
-        page_token = result.get("nextPageToken")
-        if not page_token:
-            break
+        files = result.get("files", [])
+        if files:
+            return files[0]["id"], files[0]["name"]
+
+    # 2. Recherche par préfixe (name contains)
+    result = service.files().list(
+        q=f"name contains '{image_id}' and trashed=false and mimeType != 'application/vnd.google-apps.folder'",
+        fields="files(id, name)",
+        pageSize=5,
+        includeItemsFromAllDrives=True,
+        supportsAllDrives=True,
+    ).execute()
+    for f in result.get("files", []):
+        stem = f["name"].rsplit(".", 1)[0]
+        if stem == image_id or f["name"].startswith(f"{image_id}_") or f["name"].startswith(f"{image_id}-"):
+            return f["id"], f["name"]
+
+    return None, None
 
 
 def find_in_index(

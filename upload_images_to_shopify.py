@@ -136,45 +136,29 @@ def main() -> None:
         logger.error("Google Drive non disponible — vérifiez credential-regardbeauty.json")
         sys.exit(1)
 
-    folder_id, drive_id = google_drive.find_folder_info(drive, config.GOOGLE_DRIVE_FOLDER_NAME)
-
-    # Index fichiers (une passe sur le Shared Drive ou scan récursif MyDrive)
-    logger.info("Construction de l'index Drive...")
-    if folder_id:
-        drive_index = google_drive.build_drive_index(drive, folder_id, drive_id=drive_id)
-    else:
-        logger.warning("Dossier Drive introuvable — recherche fichier par fichier (lent).")
-        drive_index = {}
-
     client = ShopifyClient(dry_run=args.dry_run)
     if args.dry_run:
         logger.info("[DRY-RUN] fileCreate désactivé.")
 
     ok_count = err_count = nf_count = fuzzy_count = 0
     fuzzy_log: list[str] = []
+    total = len(to_process)
 
-    for image_id, image_ext in sorted(to_process.items()):
+    for idx, (image_id, image_ext) in enumerate(sorted(to_process.items()), 1):
         canonical = f"{image_id}.{image_ext}"
-        logger.info("Traitement : %s", canonical)
+        logger.info("[%d/%d] %s", idx, total, canonical)
 
-        # ── Résolution du fichier Drive via l'index ───────────────────────────
-        if drive_index:
-            file_id, matched_name = google_drive.find_in_index(drive_index, image_id, image_ext)
-        else:
-            # Fallback : recherche individuelle (sans index)
-            file_id, matched_name = None, None
-            found = google_drive.find_file(drive, canonical, folder_id)
-            if found:
-                file_id, matched_name = "search", canonical
+        # Recherche directe dans Drive (exact puis fuzzy)
+        file_id, matched_name = google_drive.search_file_by_id(drive, image_id, image_ext)
 
         if not file_id:
-            logger.warning("  Introuvable dans Drive (exact + fuzzy) : %s", canonical)
+            logger.warning("  Introuvable dans Drive : %s", canonical)
             nf_count += 1
             continue
 
         is_fuzzy = matched_name != canonical
         if is_fuzzy:
-            logger.info("  Correspondance fuzzy : '%s' → '%s'", canonical, matched_name)
+            logger.info("  Fuzzy : '%s' → '%s'", canonical, matched_name)
             fuzzy_log.append(f"{canonical} → {matched_name}")
             fuzzy_count += 1
 
@@ -183,11 +167,8 @@ def main() -> None:
             ok_count += 1
             continue
 
-        # ── Téléchargement ───────────────────────────────────────────────────
-        if file_id == "search":
-            file_bytes = google_drive.download_file(drive, matched_name, folder_id)
-        else:
-            file_bytes = google_drive.download_by_id(drive, file_id)
+        # Téléchargement par file_id (direct, sans re-chercher)
+        file_bytes = google_drive.download_by_id(drive, file_id)
 
         if not file_bytes:
             logger.warning("  Échec téléchargement : %s", matched_name)
