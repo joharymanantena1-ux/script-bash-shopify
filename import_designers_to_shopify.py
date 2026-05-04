@@ -1096,6 +1096,17 @@ def parse_args() -> argparse.Namespace:
         help="Supprime import_state.csv, link_state.csv et image_gid_map.csv puis quitte",
     )
     parser.add_argument(
+        "--reset-link-cache",
+        action="store_true",
+        dest="reset_link_cache",
+        default=False,
+        help=(
+            "Supprime uniquement link_state.csv puis quitte. "
+            "Utile pour forcer le re-check des liaisons produit sans toucher "
+            "import_state.csv ni image_gid_map.csv."
+        ),
+    )
+    parser.add_argument(
         "--purge-stale",
         action="store_true",
         dest="purge_stale",
@@ -1114,6 +1125,17 @@ def main() -> None:
     args = parse_args()
 
     output_dir = config.OUTPUT_DIR
+
+    # ── --reset-link-cache : supprime link_state.csv uniquement ──────────────
+    if getattr(args, "reset_link_cache", False):
+        link_state_path = output_dir / "link_state.csv"
+        if link_state_path.exists():
+            link_state_path.unlink()
+            logger.info("link_state.csv supprimé — les liaisons seront re-vérifiées au prochain import.")
+        else:
+            logger.info("link_state.csv absent (rien à supprimer).")
+        logger.info("Relancez : python import_designers_to_shopify.py --global-import --no-dry-run")
+        return
 
     # ── --reset-cache : supprime les caches locaux puis quitte ────────────────
     if args.reset_cache:
