@@ -66,6 +66,27 @@ def get_drive_service():
     return build("drive", "v3", credentials=creds)
 
 
+def search_file_by_name(service, filename: str) -> tuple[str | None, str | None]:
+    """
+    Recherche un fichier Drive par son nom exact.
+    Retourne (file_id, filename) ou (None, None).
+    C'est la stratégie principale quand on connaît le vrai nom (signature.ext depuis la DB).
+    """
+    if not filename:
+        return None, None
+    result = service.files().list(
+        q=f"name='{filename}' and trashed=false and mimeType != 'application/vnd.google-apps.folder'",
+        fields="files(id, name)",
+        pageSize=1,
+        includeItemsFromAllDrives=True,
+        supportsAllDrives=True,
+    ).execute()
+    files = result.get("files", [])
+    if files:
+        return files[0]["id"], files[0]["name"]
+    return None, None
+
+
 def search_file_by_id(service, image_id: str, image_ext: str) -> tuple[str | None, str | None]:
     """
     Recherche une image dans Drive par son image_id (cherche dans tous les drives).
