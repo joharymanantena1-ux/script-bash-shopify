@@ -487,9 +487,21 @@ def build_from_db_title(client: ShopifyClient, links_path: Path) -> dict[str, st
     shopify_normalized: dict[str, str] = {normalize_handle(t): gid for t, gid in shopify_titles.items()}
 
     mapping: dict[str, str] = {}
+    suffix_matches = 0
     for wee_id, title in title_by_id.items():
         norm = normalize_handle(title)
         gid = shopify_titles.get(title) or shopify_normalized.get(norm)
+
+        if not gid:
+            # Fallback : titre Wee = "Produit - Designer" → essaie "Produit" seul
+            # (le séparateur " - " est typique du format Wee)
+            if " - " in title:
+                stripped = title.rsplit(" - ", 1)[0].strip()
+                norm_stripped = normalize_handle(stripped)
+                gid = shopify_titles.get(stripped) or shopify_normalized.get(norm_stripped)
+                if gid:
+                    suffix_matches += 1
+
         if gid:
             mapping[wee_id] = gid
 
@@ -499,6 +511,8 @@ def build_from_db_title(client: ShopifyClient, links_path: Path) -> dict[str, st
         matched, len(all_wee_ids),
         100 * matched / len(all_wee_ids) if all_wee_ids else 0,
     )
+    if suffix_matches:
+        logger.info("  dont %d via fallback 'titre sans suffixe designer'", suffix_matches)
 
     unmatched = [wid for wid in title_by_id if wid not in mapping]
     if unmatched:
