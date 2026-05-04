@@ -809,3 +809,34 @@ class ShopifyClient:
                 break
             cursor = page_info["endCursor"]
         return mapping
+
+    def list_all_products_by_title(self) -> dict[str, str]:
+        """Retourne {title: shopify_gid} pour tous les produits Shopify (paginé).
+        Quand plusieurs produits ont le même titre, conserve le premier rencontré.
+        """
+        query = """
+        query GetProductTitles($after: String) {
+          products(first: 250, after: $after) {
+            edges { node { id title } }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+        """
+        mapping: dict[str, str] = {}
+        cursor = None
+        page = 0
+        while True:
+            page += 1
+            data = self._run(query, {"after": cursor})
+            result = data.get("products", {})
+            for edge in result.get("edges", []):
+                node = edge["node"]
+                title = node.get("title", "").strip()
+                if title and title not in mapping:
+                    mapping[title] = node["id"]
+            page_info = result.get("pageInfo", {})
+            logger.debug("Page %d : %d titre(s) chargés au total", page, len(mapping))
+            if not page_info.get("hasNextPage"):
+                break
+            cursor = page_info["endCursor"]
+        return mapping

@@ -762,8 +762,12 @@ def link_products(
         try:
             existing_mf = client.get_product_metafield(product_gid, "custom", "designer")
 
-            if existing_mf and not force_update:
-                # Mode MERGE : liaison déjà présente → on préserve sans écraser
+            # Valid GIDs = metaobjects that currently exist in Shopify (from Phase 1 cache)
+            valid_gids = set(id_to_gid.values())
+            existing_is_valid = existing_mf and existing_mf in valid_gids
+
+            if existing_is_valid and not force_update:
+                # Mode MERGE : liaison déjà présente ET valide → on préserve sans écraser
                 logger.debug(
                     "Liaison déjà présente sur produit %s (designer %s) — préservée (mode merge).",
                     wee_product_id, wee_designer_id,
@@ -781,6 +785,12 @@ def link_products(
                 _append_link_state(link_key, "ok", link_state_path)
                 skipped_links += 1
                 continue
+
+            if existing_mf and not existing_is_valid:
+                logger.info(
+                    "Produit %s a un GID obsolète (%s) — remplacement par GID valide.",
+                    wee_product_id, existing_mf,
+                )
 
             action = "updated" if existing_mf else "created"
             client.set_product_metafield(

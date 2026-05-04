@@ -290,13 +290,15 @@ def run_audit(no_api: bool, output_json: bool) -> dict:
             and wid not in shopify_wee_ids
         }
 
-        remaining_mo    = total_src - total_mo
-        remaining_links = possible - total_lnk
+        remaining_mo    = max(0, total_src - total_mo)
+        remaining_links = max(0, possible - total_lnk)
 
         logger.info("  GIDs obsolètes dans le cache           : %d", len(stale_in_cache))
         if stale_in_cache:
             logger.info("    wee_designer_ids : %s", sorted(stale_in_cache)[:15])
-        logger.info("  Metaobjects encore à créer             : %d", remaining_mo)
+        surplus_mo = total_mo - total_src if total_mo > total_src else 0
+        logger.info("  Metaobjects encore à créer             : %d%s", remaining_mo,
+                    f"  (surplus Shopify : +{surplus_mo})" if surplus_mo else "")
         logger.info("  Liens encore à faire                   : %d", remaining_links)
         logger.info("  Liens impossibles (sans mapping)       : %d", links_without_mapping)
 

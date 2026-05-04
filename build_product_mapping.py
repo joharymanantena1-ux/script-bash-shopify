@@ -20,6 +20,12 @@ Stratégies disponibles :
       barcodes des variants Shopify. Meilleure stratégie si Shopify
       stocke les EAN13 dans le champ barcode des variants.
 
+  --from-db-title
+      Lit les noms de produits depuis product_trans Wee (colonne name/title,
+      trans_id=DEFAULT_TRANS_ID), puis croise avec les titres Shopify
+      (normalisés : accents supprimés, minuscules). Utile en complément
+      des autres stratégies pour les produits sans EAN13 ou handle matchant.
+
 Diagnostic :
 
   --diagnose
@@ -30,6 +36,8 @@ Usage :
   python build_product_mapping.py --diagnose
   python build_product_mapping.py --from-db-ean --dry-run
   python build_product_mapping.py --from-db-ean
+  python build_product_mapping.py --from-db-title --dry-run
+  python build_product_mapping.py --from-db-title
   python build_product_mapping.py --from-db-handle
   python build_product_mapping.py --from-shopify
 """
@@ -399,6 +407,110 @@ def build_from_db_ean(client: ShopifyClient, links_path: Path) -> dict[str, str]
     return mapping
 
 
+# ── Stratégie E : depuis la DB Wee (titre produit) ───────────────────────────
+
+def fetch_titles_from_db(conn, all_wee_ids: list[str]) -> dict[str, str]:
+    """
+    Lit les noms de produits depuis product_trans (colonne `name` ou `title`).
+    Retourne {wee_product_id: title}.
+    """
+    from db import fetch_all
+
+    # Détecte la colonne titre dans product_trans
+    cols = fetch_all(
+        conn,
+        "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+        "WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'product_trans' "
+        "AND COLUMN_NAME IN ('name', 'title', 'label')",
+        (config.DB_NAME,),
+    )
+    if not cols:
+        return {}
+    title_col = cols[0]["COLUMN_NAME"]
+
+    title_by_id: dict[str, str] = {}
+    batch_size = 500
+    for i in range(0, len(all_wee_ids), batch_size):
+        batch = all_wee_ids[i: i + batch_size]
+        placeholders = ",".join("?" * len(batch))
+        rows = fetch_all(
+            conn,
+            f"SELECT product_id AS pid, {title_col} AS title FROM product_trans "
+            f"WHERE product_id IN ({placeholders}) AND trans_id = ?",
+            tuple(batch) + (config.DEFAULT_TRANS_ID,),
+        )
+        for r in rows:
+            pid = str(r["pid"])
+            t = str(r["title"] or "").strip()
+            if t and pid not in title_by_id:
+                title_by_id[pid] = t
+    return title_by_id
+
+
+def build_from_db_title(client: ShopifyClient, links_path: Path) -> dict[str, str]:
+    """
+    1. Lit les titres produits depuis product_trans Wee
+    2. Charge tous les titres Shopify (paginé)
+    3. Croise en normalisant (accents, casse, ponctuation) pour construire le mapping
+    """
+    from db import get_connection
+
+    if not links_path.exists():
+        logger.error("Fichier introuvable : %s — lancez d'abord export_designers_to_csv.py", links_path)
+        sys.exit(1)
+
+    with open(links_path, "r", encoding="utf-8") as f:
+        all_wee_ids = sorted({row["product_id"] for row in csv.DictReader(f) if row.get("product_id")})
+    logger.info("Wee product_id distincts dans les liens : %d", len(all_wee_ids))
+
+    with get_connection() as conn:
+        title_by_id = fetch_titles_from_db(conn, all_wee_ids)
+
+    if not title_by_id:
+        logger.error(
+            "Aucun titre trouvé dans product_trans (colonne name/title, trans_id=%s).\n"
+            "Vérifiez DEFAULT_TRANS_ID dans .env ou essayez --diagnose.",
+            config.DEFAULT_TRANS_ID,
+        )
+        sys.exit(1)
+
+    logger.info("Titres trouvés dans la DB : %d / %d", len(title_by_id), len(all_wee_ids))
+    missing = len(all_wee_ids) - len(title_by_id)
+    if missing:
+        logger.warning("%d produit(s) sans titre dans la DB — ils ne seront pas mappés.", missing)
+
+    logger.info("Chargement de tous les titres Shopify (paginé, ~3-4 min)...")
+    shopify_titles = client.list_all_products_by_title()
+    logger.info("Produits Shopify chargés : %d titre(s)", len(shopify_titles))
+
+    # Index normalisé pour matching insensible aux accents/casse
+    shopify_normalized: dict[str, str] = {normalize_handle(t): gid for t, gid in shopify_titles.items()}
+
+    mapping: dict[str, str] = {}
+    for wee_id, title in title_by_id.items():
+        norm = normalize_handle(title)
+        gid = shopify_titles.get(title) or shopify_normalized.get(norm)
+        if gid:
+            mapping[wee_id] = gid
+
+    matched = len(mapping)
+    logger.info(
+        "Correspondances titres trouvées : %d / %d wee_product_id(s) (%.1f%%)",
+        matched, len(all_wee_ids),
+        100 * matched / len(all_wee_ids) if all_wee_ids else 0,
+    )
+
+    unmatched = [wid for wid in title_by_id if wid not in mapping]
+    if unmatched:
+        logger.warning("%d produit(s) ont un titre en DB mais aucune correspondance Shopify.", len(unmatched))
+        logger.warning("  Exemples DB sans match :")
+        for wid in unmatched[:5]:
+            t = title_by_id[wid]
+            logger.warning("    wee_id=%s  title_db='%s'  normalized='%s'", wid, t, normalize_handle(t))
+
+    return mapping
+
+
 # ── Stratégie A : depuis les metafields Shopify ───────────────────────────────
 
 def build_from_shopify(client: ShopifyClient, links_path: Path) -> dict[str, str]:
@@ -760,6 +872,12 @@ def parse_args() -> argparse.Namespace:
         help="Lit les EAN13 dans la table product Wee et les croise avec les barcodes Shopify",
     )
     mode.add_argument(
+        "--from-db-title",
+        action="store_true",
+        dest="from_db_title",
+        help="Lit les titres produits dans product_trans Wee et les croise avec les titres Shopify",
+    )
+    mode.add_argument(
         "--diagnose",
         action="store_true",
         dest="diagnose",
@@ -800,6 +918,9 @@ def main() -> None:
     elif args.from_db_ean:
         mapping = build_from_db_ean(client, links_path)
         source_label = "db_ean"
+    elif args.from_db_title:
+        mapping = build_from_db_title(client, links_path)
+        source_label = "db_title"
     else:
         mapping = build_from_db_handle(client, links_path)
         source_label = "db_handle"
