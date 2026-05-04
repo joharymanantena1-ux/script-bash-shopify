@@ -68,25 +68,24 @@ def get_drive_service():
 
 def build_drive_index(service, folder_id: str, max_depth: int = 6) -> dict[str, str]:
     """
-    Construit un index récursif {filename: file_id} sous folder_id.
-    Descend dans tous les sous-dossiers jusqu'à max_depth niveaux.
-    Retourne un dict prêt pour find_in_index().
+    Construit un index {filename: file_id} pour tous les fichiers sous folder_id.
+
+    Utilise 'ancestors' pour récupérer tout l'arbre en une seule passe paginée
+    (au lieu d'une requête par sous-dossier), ce qui est ~10× plus rapide.
     """
     index: dict[str, str] = {}
-    _index_folder(service, folder_id, index, depth=0, max_depth=max_depth)
-    logger.info("Index Drive construit : %d fichier(s) trouvé(s)", len(index))
-    return index
-
-
-def _index_folder(service, folder_id: str, index: dict, depth: int, max_depth: int) -> None:
-    if depth > max_depth:
-        return
-
+    query = (
+        f"'{folder_id}' in ancestors "
+        "and mimeType != 'application/vnd.google-apps.folder' "
+        "and trashed=false"
+    )
     page_token = None
+    page = 0
     while True:
+        page += 1
         result = service.files().list(
-            q=f"'{folder_id}' in parents and trashed=false",
-            fields="nextPageToken, files(id, name, mimeType)",
+            q=query,
+            fields="nextPageToken, files(id, name)",
             pageSize=1000,
             pageToken=page_token,
             includeItemsFromAllDrives=True,
@@ -94,16 +93,18 @@ def _index_folder(service, folder_id: str, index: dict, depth: int, max_depth: i
         ).execute()
 
         for f in result.get("files", []):
-            if f["mimeType"] == "application/vnd.google-apps.folder":
-                _index_folder(service, f["id"], index, depth + 1, max_depth)
-            else:
-                name = f["name"]
-                if name not in index:
-                    index[name] = f["id"]
+            name = f["name"]
+            if name not in index:
+                index[name] = f["id"]
 
         page_token = result.get("nextPageToken")
+        if page % 5 == 0 or not page_token:
+            logger.info("Index Drive : page %d — %d fichier(s) indexé(s)...", page, len(index))
         if not page_token:
             break
+
+    logger.info("Index Drive construit : %d fichier(s) au total", len(index))
+    return index
 
 
 def find_in_index(
