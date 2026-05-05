@@ -298,6 +298,77 @@ def _rewrite_link_state(valid_designer_ids: set[str], path: Path) -> int:
     return purged
 
 
+def repair_link_cache(client: ShopifyClient, output_dir: Path) -> None:
+    """
+    Compare link_state.csv avec les liaisons réelles dans Shopify.
+    Retire uniquement les entrées fantômes (marquées 'ok' mais absentes de Shopify).
+    Les 8 890 entrées valides sont conservées — seuls les ~90 fantômes sont supprimés.
+
+    Durée : ~5-10 min (charge tous les produits liés depuis Shopify).
+    Après : relancer --global-import --no-dry-run pour traiter les manquants.
+    """
+    link_state_path   = output_dir / "link_state.csv"
+    mapping_path      = output_dir / "product_mapping.csv"
+
+    if not link_state_path.exists():
+        logger.info("link_state.csv absent — rien à réparer.")
+        return
+
+    # Charger le mapping wee_product_id → shopify_product_gid
+    product_mapping = _load_product_mapping(mapping_path)
+    logger.info("Mapping produits chargé : %d entrée(s)", len(product_mapping))
+
+    # Charger link_state.csv complet (avec toutes les colonnes)
+    with open(link_state_path, "r", encoding="utf-8") as f:
+        all_rows = list(csv.DictReader(f))
+    logger.info("link_state.csv chargé : %d ligne(s)", len(all_rows))
+
+    # Interroger Shopify : quels produits ont vraiment le metafield custom.designer ?
+    logger.info("Interrogation Shopify — chargement des produits réellement liés (~5-10 min)...")
+    linked_in_shopify: set[str] = {
+        entry["product_id"]
+        for entry in client.list_all_products_with_designer_metafield()
+    }
+    logger.info("Produits réellement liés dans Shopify : %d", len(linked_in_shopify))
+
+    # Classer chaque ligne du cache
+    kept:   list[dict] = []
+    ghosts: list[dict] = []
+
+    for row in all_rows:
+        pid   = row.get("product_id", "")
+        shopify_gid = product_mapping.get(pid)
+
+        if row.get("status") != "ok":
+            kept.append(row)
+            continue
+
+        if shopify_gid and shopify_gid in linked_in_shopify:
+            kept.append(row)
+        else:
+            ghosts.append(row)
+
+    logger.info("=" * 60)
+    logger.info("RÉSULTAT REPAIR LINK CACHE")
+    logger.info("  Entrées valides conservées : %d", len(kept))
+    logger.info("  Entrées fantômes supprimées: %d", len(ghosts))
+
+    if ghosts:
+        logger.info("  Exemples de fantômes supprimés :")
+        for g in ghosts[:10]:
+            logger.info("    product_id=%s  designer_id=%s", g.get("product_id"), g.get("wee_designer_id"))
+
+    # Réécrire link_state.csv sans les fantômes
+    with open(link_state_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=_LINK_STATE_COLUMNS)
+        writer.writeheader()
+        writer.writerows(kept)
+
+    logger.info("link_state.csv réécrit : %d entrée(s) valides conservées.", len(kept))
+    logger.info("Relancez : python import_designers_to_shopify.py --global-import --no-dry-run")
+    logger.info("  → Seuls les %d liens manquants seront traités.", len(ghosts))
+
+
 def _append_link_state(key: tuple[str, str], status: str, path: Path) -> None:
     """Ajoute une ligne dans link_state.csv (append, pas de réécriture complète)."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1107,6 +1178,17 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--repair-link-cache",
+        action="store_true",
+        dest="repair_link_cache",
+        default=False,
+        help=(
+            "Interroge Shopify pour trouver les liaisons réelles, "
+            "retire uniquement les entrées fantômes de link_state.csv "
+            "(les entrées valides sont conservées). Plus précis que --reset-link-cache."
+        ),
+    )
+    parser.add_argument(
         "--purge-stale",
         action="store_true",
         dest="purge_stale",
@@ -1135,6 +1217,12 @@ def main() -> None:
         else:
             logger.info("link_state.csv absent (rien à supprimer).")
         logger.info("Relancez : python import_designers_to_shopify.py --global-import --no-dry-run")
+        return
+
+    # ── --repair-link-cache : retire uniquement les fantômes du cache ─────────
+    if getattr(args, "repair_link_cache", False):
+        client = ShopifyClient(dry_run=False)
+        repair_link_cache(client, output_dir)
         return
 
     # ── --reset-cache : supprime les caches locaux puis quitte ────────────────
