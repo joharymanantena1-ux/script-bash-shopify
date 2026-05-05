@@ -51,8 +51,10 @@ class ShopifyClient:
         for attempt in range(1, _MAX_RETRIES + 1):
             time.sleep(_REQUEST_DELAY_S)
             try:
-                resp = self._session.post(config.SHOPIFY_GRAPHQL_URL, json=payload)
-            except requests.exceptions.ConnectionError as exc:
+                resp = self._session.post(
+                    config.SHOPIFY_GRAPHQL_URL, json=payload, timeout=30
+                )
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
                 wait = 2 * attempt
                 logger.warning(
                     "Connexion Shopify interrompue (%s) — attente %ds (tentative %d/%d)",
