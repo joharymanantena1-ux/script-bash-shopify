@@ -50,7 +50,16 @@ class ShopifyClient:
         payload = {"query": query, "variables": variables or {}}
         for attempt in range(1, _MAX_RETRIES + 1):
             time.sleep(_REQUEST_DELAY_S)
-            resp = self._session.post(config.SHOPIFY_GRAPHQL_URL, json=payload)
+            try:
+                resp = self._session.post(config.SHOPIFY_GRAPHQL_URL, json=payload)
+            except requests.exceptions.ConnectionError as exc:
+                wait = 2 * attempt
+                logger.warning(
+                    "Connexion Shopify interrompue (%s) — attente %ds (tentative %d/%d)",
+                    exc, wait, attempt, _MAX_RETRIES,
+                )
+                time.sleep(wait)
+                continue
 
             if resp.status_code == 429:
                 wait = int(resp.headers.get("Retry-After", "2"))
@@ -334,7 +343,7 @@ class ShopifyClient:
         """
         data = self._run(query, {"id": product_gid, "namespace": namespace, "key": key})
         mf = data.get("product", {}).get("metafield")
-        return mf["id"] if mf else None
+        return mf["value"] if mf else None
 
     # ── Upload d'images vers Shopify Files ────────────────────────────────────
 
