@@ -32,173 +32,215 @@ pip install -r requirements.txt
 python check_db.py
 ```
 
-> Contrôle : connexion MariaDB, existence des tables, présence du type Designer (ID=139), comptage des données.  
+> Contrôle : connexion MariaDB, tables, type Designer (ID=139), comptage.
 > Résultat attendu : tous les contrôles `[OK]`.
 
 ---
 
 ### Étape 0.2 — Créer le type metaobject `designer` dans Shopify
 
-> **À exécuter UNE SEULE FOIS.** Si le type existe déjà, le script le détecte et ne modifie rien.
+> **À exécuter UNE SEULE FOIS.** Si le type existe déjà, le script ne modifie rien.
 
 ```bash
 python setup_shopify.py
 ```
 
-> Résultat attendu : `Type 'designer' créé` ou `Type 'designer' déjà existant — aucune modification`.
-
 ---
 
-## PHASE 1 — Test sur un seul produit
+### Étape 0.3 — Corriger le nom d'affichage (une seule fois)
 
-### Étape 1.1 — Exporter le produit de test depuis MariaDB vers CSV
+> Fait que Shopify affiche le nom du designer au lieu de "Designer #XXXXX".
 
 ```bash
-python export_designers_to_csv.py --test
+python fix_designer_display_name.py
 ```
-
-> Génère `output/designers.csv` et `output/product_designer_links.csv` filtrés sur `TEST_PRODUCT_ID`.  
-> Vérifier les fichiers CSV : les colonnes `image_id` et `image_ext` doivent être remplies.
 
 ---
 
-### Étape 1.2 — Aperçu avant import (lecture seule, aucun appel API)
-
-```bash
-python import_designers_to_shopify.py --test --preview
-```
-
-> Génère `output/import_preview.csv` et affiche dans la console :
->
-> - Nombre de designers à créer / déjà en cache
-> - Statut des images (cache ou à uploader)
-> - Liens produit mappables ou manquants
->
-> Vérifier que `product_status = mappable` pour le produit de test.
-
----
-
-### Étape 1.3 — Import en dry-run (simulation, aucune écriture Shopify)
-
-```bash
-python import_designers_to_shopify.py --test --dry-run
-```
-
-> Simule la création des metaobjects et liaisons sans rien écrire dans Shopify.  
-> Vérifier `output/import_report.csv` : zéro ligne `statut=error`.  
-> Les logs sont dans `logs/import_YYYYMMDD_HHMMSS.log`.
-
----
-
-### Étape 1.4 — Import réel sur le produit de test
-
-> **Irréversible.** Créé les metaobjects et metafields dans Shopify.
-
-```bash
-python import_designers_to_shopify.py --test --no-dry-run
-```
-
-> Résultat attendu dans les logs :
->
-> - `action_metaobject = created`
-> - `action_metafield = created`
-> - `statut = ok`
->
-> `output/import_state.csv` est créé avec le GID Shopify du designer.
-
----
-
-### Étape 1.5 — Vérifier le résultat dans Shopify
-
-```bash
-python verify_shopify.py
-```
-
-> Vérifie pour le produit de test :
->
-> - Définition du type `designer` (champs et types)
-> - Metaobject : statut ACTIVE, image présente, locale `fr-FR`, baseline
-> - Metafield produit `custom.designer` lié au bon GID
->
-> Résultat attendu : tous les contrôles `[OK]`.
-
----
-
-## PHASE 2 — Import global (tous les designers)
-
-> **Seulement après validation complète de la Phase 1.**
-
-### Étape 2.1 — Export global depuis MariaDB
+## PHASE 1 — Export MariaDB → CSV
 
 ```bash
 python export_designers_to_csv.py --global-export
 ```
 
-> Génère `output/designers.csv` et `output/product_designer_links.csv` complets.
+> Génère `output/designers.csv` et `output/product_designer_links.csv`.
 
 ---
 
-### Étape 2.2 — (Optionnel) Pré-uploader toutes les images en batch
+## PHASE 2 — Mapping produits Wee → Shopify
 
-> Utile si vous avez beaucoup d'images. Évite les timeouts pendant l'import.
+Construit `output/product_mapping.csv` pour que l'import puisse lier chaque produit.  
+Plusieurs stratégies disponibles — les lancer dans l'ordre pour maximiser la couverture.
+
+### Stratégie 1 — EAN13 (recommandée en premier)
+
+```bash
+python build_product_mapping.py --from-db-ean --dry-run   # vérifier le taux de match
+python build_product_mapping.py --from-db-ean
+```
+
+### Stratégie 2 — Titre produit (complément)
+
+```bash
+python build_product_mapping.py --from-db-title --dry-run
+python build_product_mapping.py --from-db-title
+```
+
+### Stratégie 3 — Handle/slug (si EAN13 insuffisant)
+
+```bash
+python build_product_mapping.py --from-db-handle
+```
+
+### Stratégie 4 — Metafield Shopify (si wee_product_id déjà renseigné)
+
+```bash
+python build_product_mapping.py --from-shopify
+```
+
+### Diagnostic (comprendre les écarts)
+
+```bash
+python build_product_mapping.py --diagnose
+```
+
+> Les stratégies se **mergent** automatiquement dans `product_mapping.csv`.
+> Lancez-les toutes pour obtenir la meilleure couverture.
+
+---
+
+## PHASE 3 — Upload des images vers Shopify
+
+> Pré-uploade toutes les images depuis Google Drive vers Shopify Files.
+> Remplit `output/image_gid_map.csv` (cache des GID images).
 
 ```bash
 python upload_images_to_shopify.py
 ```
 
-> Remplit `output/image_gid_map.csv`. L'import suivant utilisera ce cache.
-
----
-
-### Étape 2.3 — Aperçu global
+Options :
 
 ```bash
-python import_designers_to_shopify.py --global-import --preview
+python upload_images_to_shopify.py --dry-run   # simuler sans uploader
+python upload_images_to_shopify.py --test      # seulement les images du produit de test
 ```
 
-> Vérifier les compteurs : designers à créer, images à uploader, liens sans mapping.
+> La recherche Drive suit l'ordre : bucket ciblé (`master/0000/XXXX/`) → exact global → fuzzy.
+> Durée estimée : 30-60 min pour ~600 images.
 
 ---
 
-### Étape 2.4 — Import global en dry-run
+## PHASE 4 — Import global vers Shopify
+
+### Dry-run (vérification avant écriture)
 
 ```bash
 python import_designers_to_shopify.py --global-import --dry-run
 ```
 
-> Vérifier `output/import_report.csv` : zéro `statut=error` avant de continuer.
+> Vérifier `output/import_report.csv` : zéro ligne `statut=error`.
 
----
-
-### Étape 2.5 — Import global réel
-
-> **Irréversible. Action volontaire.**
+### Import réel
 
 ```bash
 python import_designers_to_shopify.py --global-import --no-dry-run
 ```
 
-> L'import reprend automatiquement là où il s'est arrêté si interrompu (`import_state.csv` pour Phase 1, `link_state.csv` pour Phase 2).
+> **Irréversible.** Crée les metaobjects Designer et lie les produits.
+> L'import reprend automatiquement depuis les caches si interrompu.
+
+### Options avancées
+
+```bash
+# Écraser les liaisons produit existantes (par défaut : préservation MERGE)
+python import_designers_to_shopify.py --global-import --no-dry-run --force-update
+
+# Nettoyer les GIDs obsolètes du cache avant de relancer
+python import_designers_to_shopify.py --purge-stale
+```
+
+---
+
+## PHASE 5 — Audit et vérification
+
+```bash
+python audit_shopify.py
+```
+
+> Affiche un tableau de bord complet :
+>
+> - % Metaobjects créés dans Shopify
+> - % Liaisons produit effectuées
+> - % Images uploadées
+> - % Mapping produits couverts
+> - GIDs obsolètes dans le cache
+> - Recommandations d'actions
+
+Options :
+
+```bash
+python audit_shopify.py --no-api    # analyse locale uniquement (sans appels Shopify)
+python audit_shopify.py --json      # sortie JSON pour traitement automatisé
+```
 
 ---
 
 ## Commandes utilitaires
 
-### Remettre les caches à zéro (nouveau départ)
+### Reset du cache des liens uniquement (sans toucher les metaobjects ni les images)
+
+```bash
+python import_designers_to_shopify.py --reset-link-cache
+```
+
+> Supprime `output/link_state.csv`.
+> À utiliser quand des liens sont en cache mais pas réellement dans Shopify.
+> Relancez ensuite `--global-import --no-dry-run`.
+
+### Reset complet de tous les caches locaux
 
 ```bash
 python import_designers_to_shopify.py --reset-cache
 ```
 
-> Supprime `output/import_state.csv` et `output/image_gid_map.csv`.  
-> À utiliser si vous voulez forcer un re-import complet depuis zéro.
+> Supprime `import_state.csv`, `link_state.csv`, `image_gid_map.csv`.
+> ⚠️ Les images devront être ré-uploadées.
+
+### Supprimer tous les metaobjects Designer dans Shopify
+
+```bash
+python cleanup_shopify.py
+```
+
+> ⚠️ Irréversible. Supprime toutes les entrées Designer dans Shopify.
+> À utiliser uniquement pour repartir à zéro.
 
 ---
 
-### Re-vérifier Shopify à tout moment
+## Séquence rapide — Corriger sans repartir à zéro
+
+Si les metaobjects existent déjà et qu'il faut juste corriger les liaisons et images :
 
 ```bash
-python verify_shopify.py
+python upload_images_to_shopify.py
+python import_designers_to_shopify.py --reset-link-cache
+python import_designers_to_shopify.py --global-import --no-dry-run
+python audit_shopify.py
+```
+
+---
+
+## Séquence complète — Repartir à zéro
+
+```bash
+python cleanup_shopify.py
+python import_designers_to_shopify.py --reset-cache
+python export_designers_to_csv.py --global-export
+python build_product_mapping.py --from-db-ean
+python build_product_mapping.py --from-db-title
+python upload_images_to_shopify.py
+python import_designers_to_shopify.py --global-import --no-dry-run
+python audit_shopify.py
 ```
 
 ---
@@ -209,10 +251,13 @@ python verify_shopify.py
 | --- | --- |
 | `output/designers.csv` | Données designers exportées depuis MariaDB |
 | `output/product_designer_links.csv` | Liaisons produit ↔ designer |
-| `output/import_report.csv` | Rapport de chaque run d'import |
-| `output/import_preview.csv` | Aperçu généré par `--preview` |
+| `output/product_mapping.csv` | Correspondances wee_product_id → shopify_gid |
+| `output/image_gid_map.csv` | Cache des GID Shopify des images uploadées |
 | `output/import_state.csv` | Cache Phase 1 — metaobjects (reprise après interruption) |
 | `output/link_state.csv` | Cache Phase 2 — liens produit (reprise après interruption) |
-| `output/image_gid_map.csv` | Cache des GID Shopify des images |
+| `output/import_report.csv` | Rapport détaillé de chaque run d'import |
 | `logs/import_*.log` | Logs horodatés de chaque import |
 | `logs/export_*.log` | Logs horodatés de chaque export |
+| `logs/upload_images_*.log` | Logs horodatés de chaque upload d'images |
+| `logs/product_mapping_*.log` | Logs horodatés de chaque build du mapping |
+| `logs/audit_*.log` | Logs horodatés de chaque audit |
