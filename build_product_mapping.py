@@ -32,8 +32,15 @@ Diagnostic :
       Montre des exemples de slugs DB vs handles Shopify pour comprendre
       les divergences SANS écrire de fichier (lecture seule).
 
+  --diagnose-unmapped
+      Analyse les produits présents dans product_designer_links.csv mais
+      absents de product_mapping.csv. Cherche leur titre en DB Wee, tente
+      un matching Shopify, et exporte output/unmapped_diagnosis.json.
+      Lecture seule — ne modifie pas product_mapping.csv.
+
 Usage :
   python build_product_mapping.py --diagnose
+  python build_product_mapping.py --diagnose-unmapped
   python build_product_mapping.py --from-db-ean --dry-run
   python build_product_mapping.py --from-db-ean
   python build_product_mapping.py --from-db-title --dry-run
@@ -854,6 +861,159 @@ def run_diagnose(client: ShopifyClient, links_path: Path) -> None:
     logger.info("  DEFAULT_TRANS_ID=%s dans .env", config.DEFAULT_TRANS_ID)
 
 
+# ── Diagnostic : produits non mappés ─────────────────────────────────────────
+
+def run_diagnose_unmapped(client: ShopifyClient, links_path: Path, mapping_path: Path) -> None:
+    """
+    Analyse les produits dans product_designer_links.csv qui n'ont pas de
+    correspondance dans product_mapping.csv.
+
+    Pour chaque produit non mappé :
+      - Cherche son titre dans la DB Wee
+      - Tente un matching Shopify (exact + normalisé + suffixe)
+      - Classe en : MATCHABLE (trouvé côté Shopify), ABSENT (introuvable)
+
+    Exporte output/unmapped_diagnosis.json — lecture seule.
+    """
+    import json
+    from db import get_connection
+
+    # ── Charger les IDs non mappés ────────────────────────────────────────────
+    with open(links_path, "r", encoding="utf-8") as f:
+        all_links = list(csv.DictReader(f))
+    all_wee_ids_linked = sorted({r["product_id"] for r in all_links if r.get("product_id")})
+
+    existing_mapping = load_existing_mapping(mapping_path) if mapping_path.exists() else {}
+    unmapped_ids = [pid for pid in all_wee_ids_linked if pid not in existing_mapping]
+
+    logger.info("=" * 60)
+    logger.info("DIAGNOSTIC PRODUITS NON MAPPÉS")
+    logger.info("  Total liés à un designer  : %d", len(all_wee_ids_linked))
+    logger.info("  Déjà mappés               : %d", len(existing_mapping))
+    logger.info("  Non mappés (à analyser)   : %d", len(unmapped_ids))
+    logger.info("=" * 60)
+
+    if not unmapped_ids:
+        logger.info("Tous les produits sont mappés.")
+        return
+
+    # ── Récupérer les titres DB pour les non mappés ───────────────────────────
+    with get_connection() as conn:
+        title_by_id = fetch_titles_from_db(conn, unmapped_ids)
+
+    logger.info("Titres trouvés dans la DB pour les non mappés : %d / %d",
+                len(title_by_id), len(unmapped_ids))
+
+    # ── Charger tous les titres Shopify ───────────────────────────────────────
+    logger.info("Chargement des titres Shopify (paginé)...")
+    shopify_titles = client.list_all_products_by_title()
+    shopify_normalized: dict[str, str] = {normalize_handle(t): gid for t, gid in shopify_titles.items()}
+    logger.info("Produits Shopify chargés : %d", len(shopify_titles))
+
+    # ── Designer lookup ───────────────────────────────────────────────────────
+    designers_csv = links_path.parent / "designers.csv"
+    designer_by_id: dict[str, str] = {}
+    if designers_csv.exists():
+        with open(designers_csv, "r", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                designer_by_id[row["wee_designer_id"]] = row.get("nom", "")
+    designer_by_product: dict[str, tuple[str, str]] = {}
+    for link in all_links:
+        pid = link["product_id"]
+        if pid in unmapped_ids and pid not in designer_by_product:
+            did = link.get("wee_designer_id", "")
+            designer_by_product[pid] = (did, designer_by_id.get(did, ""))
+
+    # ── Tenter le matching pour chaque produit non mappé ─────────────────────
+    matchable: list[dict] = []
+    absent_from_shopify: list[dict] = []
+    no_title_in_db: list[dict] = []
+
+    for pid in unmapped_ids:
+        did, dnom = designer_by_product.get(pid, ("", ""))
+
+        if pid not in title_by_id:
+            no_title_in_db.append({
+                "wee_product_id": pid,
+                "wee_designer_id": did,
+                "designer_nom": dnom,
+                "raison": "pas_de_titre_en_db",
+            })
+            continue
+
+        title = title_by_id[pid]
+        norm = normalize_handle(title)
+
+        # Tentative matching (même logique que build_from_db_title)
+        gid = shopify_titles.get(title) or shopify_normalized.get(norm)
+        matched_title = None
+        if gid:
+            matched_title = title
+        elif " - " in title:
+            stripped = title.rsplit(" - ", 1)[0].strip()
+            norm_stripped = normalize_handle(stripped)
+            gid = shopify_titles.get(stripped) or shopify_normalized.get(norm_stripped)
+            if gid:
+                matched_title = stripped
+
+        entry = {
+            "wee_product_id": pid,
+            "wee_designer_id": did,
+            "designer_nom": dnom,
+            "titre_db": title,
+            "titre_shopify_match": matched_title,
+            "shopify_gid": gid,
+        }
+
+        if gid:
+            matchable.append(entry)
+        else:
+            absent_from_shopify.append(entry)
+
+    # ── Résumé ────────────────────────────────────────────────────────────────
+    logger.info("-" * 60)
+    logger.info("RÉSULTATS :")
+    logger.info("  Matchables (titre trouvé côté Shopify) : %d", len(matchable))
+    logger.info("  Absents de Shopify (titre sans match)  : %d", len(absent_from_shopify))
+    logger.info("  Sans titre en DB Wee                   : %d", len(no_title_in_db))
+
+    if matchable:
+        logger.info("\n  Exemples MATCHABLES (peuvent être ajoutés au mapping) :")
+        for e in matchable[:10]:
+            logger.info("    wee_id=%-8s  db='%s'  → shopify='%s'",
+                        e["wee_product_id"], e["titre_db"], e["titre_shopify_match"])
+
+    if absent_from_shopify:
+        logger.info("\n  Exemples ABSENTS de Shopify (produits probablement archivés/supprimés) :")
+        for e in absent_from_shopify[:10]:
+            logger.info("    wee_id=%-8s  db='%s'", e["wee_product_id"], e["titre_db"])
+
+    # ── Export JSON ───────────────────────────────────────────────────────────
+    out_path = links_path.parent / "unmapped_diagnosis.json"
+    report = {
+        "résumé": {
+            "total_non_mappés": len(unmapped_ids),
+            "matchables": len(matchable),
+            "absents_de_shopify": len(absent_from_shopify),
+            "sans_titre_en_db": len(no_title_in_db),
+        },
+        "matchables": matchable,
+        "absents_de_shopify": absent_from_shopify[:200],
+        "sans_titre_en_db": no_title_in_db[:100],
+    }
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+
+    logger.info("\nRapport exporté → %s", out_path)
+    if matchable:
+        logger.info(
+            "\n  → %d produits sont matchables mais non encore dans product_mapping.csv.",
+            len(matchable),
+        )
+        logger.info("  → Relancez : python build_product_mapping.py --from-db-title")
+        logger.info("    (les nouvelles correspondances seront MERGÉES dans product_mapping.csv)")
+
+
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
@@ -897,6 +1057,12 @@ def parse_args() -> argparse.Namespace:
         dest="diagnose",
         help="Affiche des exemples slugs DB vs handles Shopify pour comprendre les écarts",
     )
+    mode.add_argument(
+        "--diagnose-unmapped",
+        action="store_true",
+        dest="diagnose_unmapped",
+        help="Analyse les produits non mappés : matchables vs absents de Shopify. Exporte unmapped_diagnosis.json",
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -921,6 +1087,13 @@ def main() -> None:
             logger.error("Lancez d'abord : python export_designers_to_csv.py --global-export")
             sys.exit(1)
         run_diagnose(client, links_path)
+        return
+
+    if getattr(args, "diagnose_unmapped", False):
+        if not links_path.exists():
+            logger.error("Lancez d'abord : python export_designers_to_csv.py --global-export")
+            sys.exit(1)
+        run_diagnose_unmapped(client, links_path, mapping_path)
         return
 
     if args.from_shopify:
