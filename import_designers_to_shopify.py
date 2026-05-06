@@ -1333,7 +1333,11 @@ def main() -> None:
 
     # ── --patch-images : met à jour le champ image des metaobjects existants ──
     if getattr(args, "patch_images", False):
-        dry_run = config.DRY_RUN if not getattr(args, "no_dry_run", False) else False
+        dry_run_flag = getattr(args, "dry_run_flag", None)
+        if dry_run_flag is None:
+            dry_run = config.DRY_RUN
+        else:
+            dry_run = dry_run_flag
         client = ShopifyClient(dry_run=dry_run)
         patch_images(client, output_dir, dry_run=dry_run)
         return
