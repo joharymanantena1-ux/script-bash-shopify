@@ -609,7 +609,7 @@ def patch_images(client: ShopifyClient, output_dir: Path, dry_run: bool = False)
         if wid and wid not in id_to_row:
             id_to_row[wid] = row
 
-    updated = skipped_no_image = skipped_no_gid = errors = 0
+    updated = skipped_no_image = skipped_no_gid = errors = stale_purged = 0
 
     for wee_id, state_row in import_state.items():
         metaobject_gid = state_row.get("shopify_metaobject_gid", "")
@@ -648,16 +648,36 @@ def patch_images(client: ShopifyClient, output_dir: Path, dry_run: bool = False)
             client.update_metaobject(metaobject_gid, {"image": file_gid})
             updated += 1
         except ShopifyGraphQLError as exc:
-            logger.error("  Erreur mise à jour designer %s : %s", wee_id, exc)
-            errors += 1
+            err_str = str(exc)
+            if "non-existent resource" in err_str:
+                # GID stale : supprimé de Shopify Files → retirer du cache
+                logger.warning(
+                    "  GID image obsolète pour designer %s (%s) — retiré du cache.",
+                    wee_id, file_gid[:50],
+                )
+                del image_gid_map[image_id]
+                stale_purged += 1
+            else:
+                logger.error("  Erreur mise à jour designer %s : %s", wee_id, exc)
+                errors += 1
+
+    # Réécrire image_gid_map.csv si des GIDs obsolètes ont été purgés
+    if stale_purged:
+        _save_image_gid_map(image_gid_map, {}, gid_map_path)
+        logger.info(
+            "%d GID(s) image obsolètes purgés du cache. "
+            "Relancez : python upload_images_to_shopify.py puis --patch-images --no-dry-run",
+            stale_purged,
+        )
 
     logger.info("=" * 60)
     logger.info("RÉSUMÉ PATCH IMAGES%s", " (DRY-RUN)" if dry_run else "")
-    logger.info("  Metaobjects mis à jour : %d", updated)
-    logger.info("  Sans image disponible  : %d", skipped_no_image)
-    logger.info("  Sans GID metaobject    : %d", skipped_no_gid)
+    logger.info("  Metaobjects mis à jour  : %d", updated)
+    logger.info("  GIDs image obsolètes    : %d  (purgés du cache)", stale_purged)
+    logger.info("  Sans image disponible   : %d", skipped_no_image)
+    logger.info("  Sans GID metaobject     : %d", skipped_no_gid)
     if errors:
-        logger.error("  Erreurs                : %d", errors)
+        logger.error("  Erreurs                 : %d", errors)
     if not dry_run and updated:
         logger.info("Relancez python audit_shopify.py pour vérifier.")
 
