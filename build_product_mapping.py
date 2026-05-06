@@ -45,6 +45,8 @@ Usage :
   python build_product_mapping.py --from-db-ean
   python build_product_mapping.py --from-db-title --dry-run
   python build_product_mapping.py --from-db-title
+  python build_product_mapping.py --from-db-title-fuzzy --dry-run
+  python build_product_mapping.py --from-db-title-fuzzy
   python build_product_mapping.py --from-db-handle
   python build_product_mapping.py --from-shopify
 """
@@ -52,6 +54,7 @@ Usage :
 import argparse
 import csv
 import logging
+import re
 import sys
 import unicodedata
 from pathlib import Path
@@ -96,6 +99,56 @@ def normalize_handle(s: str) -> str:
     nfkd = unicodedata.normalize("NFKD", s)
     no_accents = "".join(c for c in nfkd if not unicodedata.combining(c))
     return no_accents.lower().replace(" ", "-").replace("_", "-")
+
+
+# ── Normalisation fuzzy (couleurs, tailles, articles) ────────────────────────
+
+_COLOR_WORDS = (
+    "rouge|bleu|bleue|vert|verte|blanc|blanche|noir|noire|jaune|gris|grise|"
+    "beige|orange|violet|violette|rose|turquoise|transparent|transparente|"
+    "chrome|chrome|naturel|naturelle|ivoire|taupe|anthracite|argent|dore|doree|"
+    "cuivre|bordeaux|ecru|sable|fumee|fume|platine|marron|brun|brune|ocre|"
+    "chocolat|caramel|creme|emeraude|indigo|lie-de-vin|pourpre|aubergine"
+)
+_ARTICLES = r"\b(le|la|les|l|un|une|des|du|de|d|en|avec|sans|et)\b"
+_SIZE_RE   = re.compile(r"\b\d+[\s.,]?\d*\s*(?:cm|mm|m(?!\w)|l(?!\w)|cl|kg|g(?!\w))\b", re.IGNORECASE)
+_COLOR_RE  = re.compile(r"\b(" + _COLOR_WORDS + r")\b", re.IGNORECASE)
+_ARTICLE_RE = re.compile(_ARTICLES, re.IGNORECASE)
+_MULTI_SPACE = re.compile(r"\s{2,}")
+
+
+def normalize_fuzzy(s: str) -> str:
+    """
+    Normalisation agressive pour le matching flou :
+      1. Supprime le suffixe " - Designer" (format Wee)
+      2. Supprime accents
+      3. Minuscules
+      4. Supprime couleurs, tailles (cm/mm…), articles
+      5. Normalise espaces et tirets
+    Exemple : "Tabouret rouge 75 cm Charles Ghost - Kartell"
+              → "tabouret charles ghost"
+    """
+    # 1. Suffixe designer (format "Produit - Designer")
+    if " - " in s:
+        s = s.rsplit(" - ", 1)[0].strip()
+
+    # 2. Accents
+    nfkd = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in nfkd if not unicodedata.combining(c))
+
+    # 3. Minuscules
+    s = s.lower()
+
+    # 4. Tailles et couleurs
+    s = _SIZE_RE.sub(" ", s)
+    s = _COLOR_RE.sub(" ", s)
+    s = _ARTICLE_RE.sub(" ", s)
+
+    # 5. Ponctuation → espace, normalise espaces
+    s = re.sub(r"[^\w\s]", " ", s)
+    s = _MULTI_SPACE.sub(" ", s).strip()
+
+    return s
 
 
 # ── CSV ───────────────────────────────────────────────────────────────────────
@@ -648,6 +701,122 @@ def build_from_db_handle(client: ShopifyClient, links_path: Path) -> dict[str, s
     return mapping
 
 
+# ── Stratégie F : matching flou (couleurs + tailles supprimées) ───────────────
+
+def build_from_db_title_fuzzy(client: ShopifyClient, links_path: Path, mapping_path: Path) -> dict[str, str]:
+    """
+    Cible uniquement les produits NON encore mappés dans product_mapping.csv.
+    Pour chaque produit sans mapping :
+      1. Récupère son titre en DB Wee
+      2. Normalise agressivement (supprime couleur, taille, articles, suffixe designer)
+      3. Compare avec les titres Shopify normalisés de la même façon
+    Ne touche pas les entrées existantes — MERGE automatique dans main().
+    """
+    from db import get_connection
+
+    if not links_path.exists():
+        logger.error("Fichier introuvable : %s — lancez d'abord export_designers_to_csv.py", links_path)
+        sys.exit(1)
+
+    # Charger seulement les IDs non encore mappés
+    existing_mapping = load_existing_mapping(mapping_path) if mapping_path.exists() else {}
+    with open(links_path, "r", encoding="utf-8") as f:
+        all_wee_ids = sorted({row["product_id"] for row in csv.DictReader(f) if row.get("product_id")})
+    unmapped_ids = [pid for pid in all_wee_ids if pid not in existing_mapping]
+
+    logger.info("Wee product_id non mappés à analyser : %d", len(unmapped_ids))
+    if not unmapped_ids:
+        logger.info("Tous les produits sont déjà mappés.")
+        return {}
+
+    # Titres DB pour les non-mappés
+    with get_connection() as conn:
+        title_by_id = fetch_titles_from_db(conn, unmapped_ids)
+
+    logger.info("Titres trouvés en DB pour les non-mappés : %d / %d",
+                len(title_by_id), len(unmapped_ids))
+    if not title_by_id:
+        logger.error("Aucun titre trouvé. Vérifiez DEFAULT_TRANS_ID dans .env.")
+        sys.exit(1)
+
+    # Charger tous les titres Shopify
+    logger.info("Chargement des titres Shopify (paginé, ~3-4 min)...")
+    shopify_titles = client.list_all_products_by_title()
+    logger.info("Produits Shopify chargés : %d", len(shopify_titles))
+
+    # Construire les index normalisés Shopify
+    shopify_norm:  dict[str, str] = {normalize_handle(t): gid for t, gid in shopify_titles.items()}
+    shopify_fuzzy: dict[str, str] = {normalize_fuzzy(t): gid  for t, gid in shopify_titles.items()}
+
+    mapping: dict[str, str] = {}
+    stats = {"exact": 0, "norm": 0, "suffix": 0, "fuzzy_full": 0, "fuzzy_suffix": 0}
+
+    for wee_id, title in title_by_id.items():
+        gid = None
+
+        # Étape 1 : exact
+        gid = shopify_titles.get(title)
+        if gid:
+            stats["exact"] += 1
+
+        # Étape 2 : normalisé (accents/casse)
+        if not gid:
+            gid = shopify_norm.get(normalize_handle(title))
+            if gid:
+                stats["norm"] += 1
+
+        # Étape 3 : suffixe designer retiré
+        if not gid and " - " in title:
+            stripped = title.rsplit(" - ", 1)[0].strip()
+            gid = shopify_titles.get(stripped) or shopify_norm.get(normalize_handle(stripped))
+            if gid:
+                stats["suffix"] += 1
+
+        # Étape 4 : fuzzy complet (couleurs + tailles supprimées)
+        if not gid:
+            fuzz = normalize_fuzzy(title)
+            gid = shopify_fuzzy.get(fuzz)
+            if gid:
+                stats["fuzzy_full"] += 1
+                logger.debug("  Fuzzy full : '%s' → '%s'", title, fuzz)
+
+        # Étape 5 : fuzzy + suffixe designer retiré
+        if not gid and " - " in title:
+            stripped = title.rsplit(" - ", 1)[0].strip()
+            fuzz = normalize_fuzzy(stripped)
+            gid = shopify_fuzzy.get(fuzz)
+            if gid:
+                stats["fuzzy_suffix"] += 1
+                logger.debug("  Fuzzy suffix : '%s' → '%s'", title, fuzz)
+
+        if gid:
+            mapping[wee_id] = gid
+
+    matched = len(mapping)
+    total   = len(unmapped_ids)
+    logger.info("=" * 60)
+    logger.info("RÉSULTATS FUZZY TITLE (%d / %d non-mappés — %.1f%%)",
+                matched, total, 100 * matched / total if total else 0)
+    logger.info("  Exact          : %d", stats["exact"])
+    logger.info("  Normalisé      : %d", stats["norm"])
+    logger.info("  Suffixe        : %d", stats["suffix"])
+    logger.info("  Fuzzy complet  : %d", stats["fuzzy_full"])
+    logger.info("  Fuzzy suffixe  : %d", stats["fuzzy_suffix"])
+
+    # Exemples pour vérification manuelle
+    fuzzy_examples = [
+        (wid, title_by_id[wid], mapping[wid])
+        for wid in list(mapping)[:15]
+        if wid in title_by_id
+    ]
+    if fuzzy_examples:
+        logger.info("Exemples de correspondances (vérifiez la pertinence) :")
+        for wid, t, gid in fuzzy_examples:
+            logger.info("  wee_id=%-8s  db='%s'  →  %s", wid, t[:60], gid[:40])
+
+    return mapping
+
+
 # ── Mode diagnostic ───────────────────────────────────────────────────────────
 
 def run_diagnose(client: ShopifyClient, links_path: Path) -> None:
@@ -1052,6 +1221,12 @@ def parse_args() -> argparse.Namespace:
         help="Lit les titres produits dans product_trans Wee et les croise avec les titres Shopify",
     )
     mode.add_argument(
+        "--from-db-title-fuzzy",
+        action="store_true",
+        dest="from_db_title_fuzzy",
+        help="Matching flou sur titres Wee (couleurs/tailles supprimées) — cible uniquement les non-mappés",
+    )
+    mode.add_argument(
         "--diagnose",
         action="store_true",
         dest="diagnose",
@@ -1108,6 +1283,9 @@ def main() -> None:
     elif args.from_db_title:
         mapping = build_from_db_title(client, links_path)
         source_label = "db_title"
+    elif getattr(args, "from_db_title_fuzzy", False):
+        mapping = build_from_db_title_fuzzy(client, links_path, mapping_path)
+        source_label = "db_title_fuzzy"
     else:
         mapping = build_from_db_handle(client, links_path)
         source_label = "db_handle"
