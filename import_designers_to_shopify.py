@@ -567,6 +567,101 @@ def purge_stale_cache(client: ShopifyClient, output_dir: Path) -> None:
     )
 
 
+# ── Patch images sur metaobjects existants ───────────────────────────────────
+
+def patch_images(client: ShopifyClient, output_dir: Path, dry_run: bool = False) -> None:
+    """
+    Met à jour le champ 'image' des metaobjects déjà créés qui n'ont pas encore d'image.
+
+    Flux :
+      1. Charge import_state.csv     → {wee_designer_id: gid}
+      2. Charge designers.csv        → image_id par designer
+      3. Charge image_gid_map.csv    → {image_id: shopify_file_gid}
+      4. Pour chaque designer avec gid + image disponible → update_metaobject(gid, {image: file_gid})
+
+    Ne ré-upload pas les images — lance d'abord upload_images_to_shopify.py.
+    """
+    import_state_path = output_dir / "import_state.csv"
+    designers_csv     = output_dir / "designers.csv"
+    gid_map_path      = output_dir / "image_gid_map.csv"
+
+    if not import_state_path.exists():
+        logger.error("import_state.csv absent — lancez d'abord --global-import.")
+        return
+    if not designers_csv.exists():
+        logger.error("designers.csv absent — lancez d'abord export_designers_to_csv.py.")
+        return
+
+    import_state = _load_import_state(import_state_path)
+    image_gid_map = _load_image_gid_map(gid_map_path)
+
+    logger.info("import_state.csv : %d designer(s) en cache", len(import_state))
+    logger.info("image_gid_map.csv : %d image(s) disponibles", len(image_gid_map))
+
+    # Charger designers.csv pour récupérer image_id par wee_designer_id
+    with open(designers_csv, "r", encoding="utf-8") as f:
+        all_designers = list(csv.DictReader(f))
+
+    # On prend une seule ligne par wee_designer_id (priorité FR)
+    id_to_row: dict[str, dict] = {}
+    for row in sorted(all_designers, key=lambda r: (0 if r.get("langue") == "fr_FR" else 1)):
+        wid = str(row.get("wee_designer_id", ""))
+        if wid and wid not in id_to_row:
+            id_to_row[wid] = row
+
+    updated = skipped_no_image = skipped_no_gid = errors = 0
+
+    for wee_id, state_row in import_state.items():
+        metaobject_gid = state_row.get("shopify_metaobject_gid", "")
+        if not metaobject_gid or metaobject_gid.startswith("[DRY-RUN"):
+            skipped_no_gid += 1
+            continue
+
+        designer_row = id_to_row.get(wee_id)
+        if not designer_row:
+            skipped_no_gid += 1
+            continue
+
+        image_id = str(designer_row.get("image_id", "") or "").strip()
+        if not image_id:
+            skipped_no_image += 1
+            continue
+
+        # Clé image_gid_map = str(image_id), identique à upload_images_to_shopify.py
+        file_gid = image_gid_map.get(image_id)
+        if not file_gid:
+            skipped_no_image += 1
+            continue
+
+        logger.info(
+            "[%s] designer %s → image GID %s%s",
+            "DRY-RUN" if dry_run else "UPDATE",
+            wee_id, file_gid[:50],
+            " (simulé)" if dry_run else "",
+        )
+
+        if dry_run:
+            updated += 1
+            continue
+
+        try:
+            client.update_metaobject(metaobject_gid, {"image": file_gid})
+            updated += 1
+        except ShopifyGraphQLError as exc:
+            logger.error("  Erreur mise à jour designer %s : %s", wee_id, exc)
+            errors += 1
+
+    logger.info("=" * 60)
+    logger.info("RÉSUMÉ PATCH IMAGES%s", " (DRY-RUN)" if dry_run else "")
+    logger.info("  Metaobjects mis à jour : %d", updated)
+    logger.info("  Sans image disponible  : %d", skipped_no_image)
+    logger.info("  Sans GID metaobject    : %d", skipped_no_gid)
+    if errors:
+        logger.error("  Erreurs                : %d", errors)
+    if not dry_run and updated:
+        logger.info("Relancez python audit_shopify.py pour vérifier.")
+
+
 # ── Logique principale ────────────────────────────────────────────────────────
 
 def import_designers(
@@ -1198,6 +1293,17 @@ def parse_args() -> argparse.Namespace:
             "puis quitte. Relancez ensuite --global-import --no-dry-run."
         ),
     )
+    parser.add_argument(
+        "--patch-images",
+        action="store_true",
+        dest="patch_images",
+        default=False,
+        help=(
+            "Met à jour le champ image des metaobjects déjà créés "
+            "en utilisant image_gid_map.csv. "
+            "Lancez d'abord upload_images_to_shopify.py."
+        ),
+    )
 
     return parser.parse_args()
 
@@ -1223,6 +1329,13 @@ def main() -> None:
     if getattr(args, "repair_link_cache", False):
         client = ShopifyClient(dry_run=False)
         repair_link_cache(client, output_dir)
+        return
+
+    # ── --patch-images : met à jour le champ image des metaobjects existants ──
+    if getattr(args, "patch_images", False):
+        dry_run = config.DRY_RUN if not getattr(args, "no_dry_run", False) else False
+        client = ShopifyClient(dry_run=dry_run)
+        patch_images(client, output_dir, dry_run=dry_run)
         return
 
     # ── --reset-cache : supprime les caches locaux puis quitte ────────────────
